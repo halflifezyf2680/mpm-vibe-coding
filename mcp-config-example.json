@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "mpm": {
+      "command": "/path/to/mpm-go"
+    }
+  }
+}
