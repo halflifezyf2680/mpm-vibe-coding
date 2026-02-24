@@ -2,6 +2,7 @@ import os
 import shutil
 import pathlib
 import sys
+import argparse
 
 # 设置 UTF-8 编码输出
 if sys.platform == "win32":
@@ -11,13 +12,15 @@ if sys.platform == "win32":
     sys.stderr = codecs.getwriter("utf-8")(sys.stderr.buffer, "strict")
 
 
-def package_mpm():
+def package_mpm(version: str):
     # 动态获取当前脚本所在目录作为根目录
     root = pathlib.Path(__file__).parent.resolve()
-    # 使用时间戳生成版本号
-    from datetime import datetime
 
-    ver = datetime.now().strftime("%Y%m%d")
+    ver = version.strip()
+    if not ver:
+        raise ValueError("版本号不能为空")
+    if any(ch in ver for ch in ("/", "\\", ":", "*", "?", '"', "<", ">", "|")):
+        raise ValueError(f"版本号包含非法字符: {ver}")
     release_root = root / f"release_v{ver}"
     dist = release_root / "MyProjectManager"
 
@@ -28,7 +31,7 @@ def package_mpm():
     # 创建多级目录
     dist.mkdir(parents=True)
 
-    print(f"🚀 开始打包 MyProjectManager (Base: {root})...")
+    print(f"🚀 开始打包 MyProjectManager v{ver} (Base: {root})...")
     print(f"📂 目标路径: {dist}")
 
     # 定义需要包含的核心文件夹
@@ -145,4 +148,10 @@ def package_mpm():
 
 
 if __name__ == "__main__":
-    package_mpm()
+    parser = argparse.ArgumentParser(description="打包 MyProjectManager 发布目录")
+    parser.add_argument(
+        "version",
+        help="发布版本号，例如 1.3.0 或 2026.02",
+    )
+    args = parser.parse_args()
+    package_mpm(args.version)

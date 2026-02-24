@@ -60,8 +60,12 @@ func wrapSearch(sm *SessionManager, ai *services.ASTIndexer) server.ToolHandlerF
 			return mcp.NewToolResultError(fmt.Sprintf("参数格式错误: %v", err)), nil
 		}
 
-		// 🆕 【关键】先刷新索引，确保数据最新
-		_, _ = ai.Index(sm.ProjectRoot)
+		// 优先按范围补录（热点目录），否则按新鲜度检查全量索引
+		if strings.TrimSpace(args.Scope) != "" {
+			_, _ = ai.IndexScope(sm.ProjectRoot, args.Scope)
+		} else {
+			_, _ = ai.EnsureFreshIndex(sm.ProjectRoot)
+		}
 
 		// 1. AST Search (Core Strategy)
 		astResult, err := ai.SearchSymbolWithScope(sm.ProjectRoot, args.Query, args.Scope)

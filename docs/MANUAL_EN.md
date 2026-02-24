@@ -35,7 +35,8 @@ Perception      Scheduling      Memory
 ────────────────────────────────────────
 code_search     manager_analyze   memo
 code_impact     task_chain        system_recall
-project_map                       known_facts
+project_map     index_status      known_facts
+flow_trace
 ```
 
 - **Perception**: See code (locate, analyze, map)
@@ -58,7 +59,7 @@ MPM uses a Rust AST engine to parse code, maintaining three core fields:
 
 ## 2. Tool Reference
 
-### 2.1 Code Location (3 tools)
+### 2.1 Code Location (4 tools)
 
 #### project_map - Project Map
 
@@ -158,7 +159,31 @@ LAYER_2_INDIRECT (11):
 
 ---
 
-### 2.2 Task Management (5 tools)
+#### flow_trace - Business Flow Trace
+
+**Triggers**: `mpm flow`
+
+**Purpose**: Read the main business chain as "entry-upstream-downstream". Compared to `code_impact`, this focuses on flow comprehension.
+
+**Parameters**:
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `symbol_name` / `file_path` | One of the two (symbol wins if both provided) | - |
+| `scope` | Scope filter (recommended for large repositories) | empty |
+| `direction` | `backward` / `forward` / `both` | `both` |
+| `mode` | `brief` / `standard` / `deep` (progressive disclosure) | `brief` |
+| `max_nodes` | Output node budget | `40` |
+
+**Output Focus**:
+- Entry point and location
+- Upstream/downstream key nodes
+- Critical paths Top 3
+- Stage summary / side-effects (standard/deep)
+- Budget truncation hints
+
+---
+
+### 2.2 Task Management (4 tools)
 
 #### manager_analyze - Task Intelligence Briefing
 
@@ -501,6 +526,10 @@ Personality expression strength serves as a **signal** for context health:
 - Restarted MCP Server / IDE
 - First time using MPM
 
+**Advanced options**:
+- `force_full_index=true`: force full indexing (disable bootstrap strategy for large repositories)
+- `index_status`: inspect background indexing progress / heartbeat / database file sizes
+
 **If just starting a new conversation**: Just read `dev-log.md`, no need to reinitialize.
 
 ---
@@ -568,9 +597,11 @@ complexity_score =
 | Category | Triggers | Tool |
 |----------|----------|------|
 | System | `mpm init` | `initialize_project` |
+| System | `mpm index status` | `index_status` |
 | Location | `mpm search` `mpm locate` | `code_search` |
 | Analysis | `mpm impact` `mpm dependency` | `code_impact` |
 | Map | `mpm map` `mpm structure` | `project_map` |
+| Flow | `mpm flow` | `flow_trace` |
 | Task | `mpm analyze` `mpm mg` | `manager_analyze` |
 | Chain | `mpm chain` `mpm taskchain` | `task_chain` |
 | Todo | `mpm suspend` `mpm todolist` `mpm release` | Hook Series |
@@ -582,5 +613,3 @@ complexity_score =
 ---
 
 *MPM Manual v2.0 - 2026-02*
-
-

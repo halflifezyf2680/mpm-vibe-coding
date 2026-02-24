@@ -35,7 +35,8 @@ AI 编程的三大痛点：
 ────────────────────────────────────────
 code_search     manager_analyze   memo
 code_impact     task_chain        system_recall
-project_map                       known_facts
+project_map     index_status      known_facts
+flow_trace
 ```
 
 - **感知层**：看代码（定位、分析、地图）
@@ -58,7 +59,7 @@ MPM 使用 Rust AST 引擎解析代码，维护三个核心字段：
 
 ## 2. 工具详解
 
-### 2.1 代码定位（3个）
+### 2.1 代码定位（4个）
 
 #### project_map - 项目地图
 
@@ -158,7 +159,31 @@ LAYER_2_INDIRECT (11):
 
 ---
 
-### 2.2 任务管理（5个）
+#### flow_trace - 业务流程追踪
+
+**触发词**：`mpm 流程`、`mpm flow`
+
+**用途**：读取“入口-上游-下游”业务主链，比 `code_impact` 更偏流程理解。
+
+**参数**：
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `symbol_name` / `file_path` | 二选一（同时提供时优先 symbol） | - |
+| `scope` | 限定范围（大仓建议必填） | 空 |
+| `direction` | `backward` / `forward` / `both` | `both` |
+| `mode` | `brief` / `standard` / `deep`（渐进披露） | `brief` |
+| `max_nodes` | 输出节点预算上限 | `40` |
+
+**输出重点**：
+- 入口点与位置
+- 上下游关键节点
+- 关键路径 Top3
+- 阶段摘要 / 副作用（standard/deep）
+- 截断提示（避免 LLM 被超大输出淹没）
+
+---
+
+### 2.2 任务管理（4个）
 
 #### manager_analyze - 任务情报简报
 
@@ -541,6 +566,10 @@ known_facts(type="避坑", summarize="修改 session 逻辑前必须先检查依
 - 重启了 MCP Server / IDE
 - 首次使用 MPM
 
+**高级选项**：
+- `force_full_index=true`：强制全量索引（禁用大仓 bootstrap 策略）
+- `index_status`：查看后台索引进度/心跳/数据库体积
+
 **如果只是新开对话**：直接读 `dev-log.md` 即可，无需重新初始化。
 
 ---
@@ -608,9 +637,11 @@ complexity_score =
 | 分类 | 触发词 | 工具 |
 |------|--------|------|
 | 系统 | `mpm 初始化` | `initialize_project` |
+| 系统 | `mpm 索引状态` `mpm index status` | `index_status` |
 | 定位 | `mpm 搜索` `mpm 定位` | `code_search` |
 | 分析 | `mpm 影响` `mpm 依赖` | `code_impact` |
 | 地图 | `mpm 地图` `mpm 结构` | `project_map` |
+| 流程 | `mpm 流程` `mpm flow` | `flow_trace` |
 | 任务 | `mpm 分析` `mpm mg` | `manager_analyze` |
 | 链式 | `mpm 任务链` `mpm chain` | `task_chain` |
 | 待办 | `mpm 挂起` `mpm 待办列表` `mpm 释放` | Hook 系列 |
@@ -622,5 +653,3 @@ complexity_score =
 ---
 
 *MPM Manual v2.0 - 2026-02*
-
-

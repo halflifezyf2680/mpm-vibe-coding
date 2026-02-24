@@ -5,11 +5,15 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestMemoryLayer_AddMemos(t *testing.T) {
-	// 亮谓：兵马未动，粮草先行。先辟一临时营地以供操练。
-	tempDir, err := os.MkdirTemp("", "mcp-test-*")
+	projectTempRoot := filepath.Join(".", ".tmp-tests")
+	if err := os.MkdirAll(projectTempRoot, 0755); err != nil {
+		t.Fatalf("Failed to create test root dir: %v", err)
+	}
+	tempDir, err := os.MkdirTemp(projectTempRoot, "mcp-test-*")
 	if err != nil {
 		t.Fatalf("Failed to create temp dir: %v", err)
 	}
@@ -42,7 +46,15 @@ func TestMemoryLayer_AddMemos(t *testing.T) {
 
 	// 验证日志同步
 	devLogPath := filepath.Join(tempDir, "dev-log.md")
-	if _, err := os.Stat(devLogPath); os.IsNotExist(err) {
+	created := false
+	for i := 0; i < 20; i++ {
+		if _, err := os.Stat(devLogPath); err == nil {
+			created = true
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !created {
 		t.Errorf("dev-log.md was not created")
 	}
 

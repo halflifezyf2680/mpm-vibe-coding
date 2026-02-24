@@ -6,6 +6,7 @@ import (
 	"mcp-server-go/internal/services"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -23,6 +24,16 @@ type ProjectMapArgs struct {
 	Scope     string `json:"scope" jsonschema:"description=限定范围 (目录或文件路径，留空=整个项目)"`
 	Level     string `json:"level" jsonschema:"default=symbols,enum=structure,enum=symbols,description=视图层级"`
 	CorePaths string `json:"core_paths" jsonschema:"description=核心目录列表 (JSON 数组字符串)"`
+}
+
+// FlowTraceArgs 业务流程追踪参数
+type FlowTraceArgs struct {
+	SymbolName string `json:"symbol_name" jsonschema:"description=入口符号名（函数/类，与 file_path 二选一；若同时提供则优先 symbol_name）"`
+	FilePath   string `json:"file_path" jsonschema:"description=目标文件路径（与 symbol_name 二选一）"`
+	Scope      string `json:"scope" jsonschema:"description=限定范围（目录，超大仓库建议必填）"`
+	Direction  string `json:"direction" jsonschema:"default=both,enum=backward,enum=forward,enum=both,description=追踪方向"`
+	Mode       string `json:"mode" jsonschema:"default=brief,enum=brief,enum=standard,enum=deep,description=输出层级（brief/standard/deep）"`
+	MaxNodes   int    `json:"max_nodes" jsonschema:"default=40,description=输出节点上限"`
 }
 
 // RegisterAnalysisTools 注册分析类工具
@@ -79,6 +90,705 @@ func RegisterAnalysisTools(s *server.MCPServer, sm *SessionManager, ai *services
   "mpm 地图", "mpm 结构", "mpm map"`),
 		mcp.WithInputSchema[ProjectMapArgs](),
 	), wrapProjectMap(sm, ai))
+
+	s.AddTool(mcp.NewTool("flow_trace",
+		mcp.WithDescription(`flow_trace - 业务流程追踪（文件/函数）
+
+用途：
+  用于理解业务逻辑主链路。与 code_impact 不同，它输出可读的“入口-上游-下游”流程摘要。
+
+输入：
+  - symbol_name / file_path（二选一）
+  - 若两者都提供，优先使用 symbol_name
+  - scope（可选，建议在大项目中填写）
+  - direction: backward/forward/both（默认 both）
+  - mode: brief/standard/deep（默认 brief，渐进披露）
+  - max_nodes: 输出节点上限（默认 40）
+
+输出：
+  - 入口点
+  - 上游调用链摘要
+  - 下游依赖链摘要
+  - 风险与下一步建议
+
+示例：
+  flow_trace(symbol_name="run_indexer", scope="mcp-server-go/internal/services", direction="both")
+  flow_trace(file_path="mcp-server-go/internal/tools/analysis_tools.go", direction="forward", max_nodes=30)
+
+触发词：
+  - mpm 流程
+  - mpm flow`),
+		mcp.WithInputSchema[FlowTraceArgs](),
+	), wrapFlowTrace(sm, ai))
+}
+
+type flowTraceSnapshot struct {
+	Node        *services.Node
+	Forward     *services.ImpactResult
+	Backward    *services.ImpactResult
+	Direction   string
+	Score       float64
+	NodeKind    string
+	ExternalIn  int
+	ExternalOut int
+	InternalIn  int
+	InternalOut int
+	SideEffects []string
+	Stages      []string
+}
+
+func normalizeFlowMode(mode string) string {
+	m := strings.ToLower(strings.TrimSpace(mode))
+	switch m {
+	case "brief", "standard", "deep":
+		return m
+	default:
+		return "brief"
+	}
+}
+
+func flowNodeKind(nodeType string) string {
+	t := strings.ToLower(strings.TrimSpace(nodeType))
+	if t == "" {
+		return "callable"
+	}
+	callableTypes := map[string]bool{
+		"function":  true,
+		"method":    true,
+		"func":      true,
+		"procedure": true,
+		"lambda":    true,
+	}
+	typeTypes := map[string]bool{
+		"class":     true,
+		"struct":    true,
+		"interface": true,
+		"enum":      true,
+		"type":      true,
+	}
+	if callableTypes[t] {
+		return "callable"
+	}
+	if typeTypes[t] {
+		return "type"
+	}
+	if strings.Contains(t, "module") || strings.Contains(t, "package") || strings.Contains(t, "namespace") {
+		return "module"
+	}
+	return "other"
+}
+
+func flowKindPriority(kind string) int {
+	switch kind {
+	case "callable":
+		return 0
+	case "type":
+		return 1
+	case "module":
+		return 2
+	default:
+		return 3
+	}
+}
+
+func buildCriticalPaths(entry string, upNames []string, downNames []string, limit int) []string {
+	if limit <= 0 {
+		limit = 3
+	}
+	paths := make([]string, 0, limit)
+	seen := make(map[string]bool)
+
+	push := func(path string) {
+		p := strings.TrimSpace(path)
+		if p == "" || seen[p] {
+			return
+		}
+		seen[p] = true
+		paths = append(paths, p)
+	}
+
+	if len(upNames) > 0 && len(downNames) > 0 {
+		push(fmt.Sprintf("%s -> %s -> %s", upNames[0], entry, downNames[0]))
+	}
+	for _, up := range upNames {
+		push(fmt.Sprintf("%s -> %s", up, entry))
+		if len(paths) >= limit {
+			break
+		}
+	}
+	for _, down := range downNames {
+		push(fmt.Sprintf("%s -> %s", entry, down))
+		if len(paths) >= limit {
+			break
+		}
+	}
+
+	if len(paths) > limit {
+		return paths[:limit]
+	}
+	return paths
+}
+
+func impactDirectCount(r *services.ImpactResult) int {
+	if r == nil {
+		return 0
+	}
+	return len(r.DirectCallers)
+}
+
+func impactIndirectCount(r *services.ImpactResult) int {
+	if r == nil {
+		return 0
+	}
+	return len(r.IndirectCallers)
+}
+
+func callerNames(items []services.CallerInfo, limit int) []string {
+	out := make([]string, 0, limit)
+	for _, c := range pickCallers(items, limit) {
+		name := c.Node.Name
+		if strings.TrimSpace(name) == "" {
+			name = c.Node.QualifiedName
+		}
+		if strings.TrimSpace(name) == "" {
+			name = c.Node.ID
+		}
+		if strings.TrimSpace(name) == "" {
+			continue
+		}
+		out = append(out, name)
+	}
+	return out
+}
+
+func mergeUniqueStrings(items ...[]string) []string {
+	seen := make(map[string]bool)
+	out := make([]string, 0)
+	for _, arr := range items {
+		for _, s := range arr {
+			v := strings.TrimSpace(s)
+			if v == "" || seen[v] {
+				continue
+			}
+			seen[v] = true
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+func detectSideEffects(node *services.Node, related []services.CallerInfo) []string {
+	if node == nil {
+		return nil
+	}
+	bags := []string{node.Name, node.QualifiedName, node.FilePath}
+	for _, c := range related {
+		bags = append(bags, c.Node.Name, c.Node.QualifiedName, c.Node.FilePath)
+	}
+	joined := strings.ToLower(strings.Join(bags, " "))
+
+	tokenSet := make(map[string]bool)
+	for _, t := range strings.FieldsFunc(joined, func(r rune) bool {
+		isLower := r >= 'a' && r <= 'z'
+		isDigit := r >= '0' && r <= '9'
+		return !(isLower || isDigit)
+	}) {
+		if t != "" {
+			tokenSet[t] = true
+		}
+	}
+
+	hasToken := func(words ...string) bool {
+		for _, w := range words {
+			if tokenSet[w] {
+				return true
+			}
+		}
+		return false
+	}
+	containsAny := func(words ...string) bool {
+		for _, w := range words {
+			if strings.Contains(joined, w) {
+				return true
+			}
+		}
+		return false
+	}
+
+	scores := map[string]int{
+		"filesystem": 0,
+		"database":   0,
+		"network":    0,
+		"process":    0,
+		"state":      0,
+	}
+
+	// filesystem
+	if hasToken("file", "path", "read", "write", "mkdir", "open", "close", "stat") {
+		scores["filesystem"] += 2
+	}
+	if containsAny("filepath", "rename", "remove", "copy") {
+		scores["filesystem"] += 1
+	}
+
+	// database
+	if hasToken("db", "sql", "sqlite", "insert", "update", "delete", "commit", "transaction") {
+		scores["database"] += 2
+	}
+	if hasToken("query", "exec", "row", "rows") {
+		scores["database"] += 1
+	}
+
+	// network (stricter to reduce false positives)
+	if hasToken("http", "https", "grpc", "tcp", "udp", "socket", "request", "response", "listen", "dial") {
+		scores["network"] += 2
+	}
+	if containsAny("websocket", "endpoint", "url", "api") {
+		scores["network"] += 1
+	}
+
+	// process
+	if hasToken("exec", "command", "spawn", "process", "fork", "subprocess") {
+		scores["process"] += 2
+	}
+	if hasToken("run", "cmd") {
+		scores["process"] += 1
+	}
+
+	// state
+	if hasToken("state", "cache", "memory", "session", "lock", "mutex", "atomic") {
+		scores["state"] += 2
+	}
+	if hasToken("context") {
+		scores["state"] += 1
+	}
+
+	types := make([]string, 0, 5)
+	if scores["filesystem"] >= 2 {
+		types = append(types, "filesystem")
+	}
+	if scores["database"] >= 2 {
+		types = append(types, "database")
+	}
+	if scores["network"] >= 3 {
+		types = append(types, "network")
+	}
+	if scores["process"] >= 2 {
+		types = append(types, "process")
+	}
+	if scores["state"] >= 2 {
+		types = append(types, "state")
+	}
+
+	return mergeUniqueStrings(types)
+}
+
+func detectStages(node *services.Node, related []services.CallerInfo) []string {
+	if node == nil {
+		return nil
+	}
+	bags := []string{node.Name, node.QualifiedName}
+	for _, c := range related {
+		bags = append(bags, c.Node.Name, c.Node.QualifiedName)
+	}
+	joined := strings.ToLower(strings.Join(bags, " "))
+
+	stages := make([]string, 0, 6)
+	if strings.Contains(joined, "init") || strings.Contains(joined, "setup") || strings.Contains(joined, "new") || strings.Contains(joined, "bootstrap") || strings.Contains(joined, "load") {
+		stages = append(stages, "init")
+	}
+	if strings.Contains(joined, "validate") || strings.Contains(joined, "check") || strings.Contains(joined, "verify") || strings.Contains(joined, "guard") {
+		stages = append(stages, "validate")
+	}
+	if strings.Contains(joined, "run") || strings.Contains(joined, "process") || strings.Contains(joined, "handle") || strings.Contains(joined, "execute") || strings.Contains(joined, "build") || strings.Contains(joined, "index") {
+		stages = append(stages, "execute")
+	}
+	if strings.Contains(joined, "query") || strings.Contains(joined, "search") || strings.Contains(joined, "map") || strings.Contains(joined, "trace") || strings.Contains(joined, "analyze") {
+		stages = append(stages, "query")
+	}
+	if strings.Contains(joined, "save") || strings.Contains(joined, "write") || strings.Contains(joined, "insert") || strings.Contains(joined, "commit") || strings.Contains(joined, "persist") {
+		stages = append(stages, "persist")
+	}
+	return mergeUniqueStrings(stages)
+}
+
+func pickCallers(items []services.CallerInfo, limit int) []services.CallerInfo {
+	if limit <= 0 {
+		limit = 10
+	}
+	seen := make(map[string]bool)
+	out := make([]services.CallerInfo, 0, limit)
+	for _, c := range items {
+		id := c.Node.ID
+		if id == "" {
+			id = c.Node.QualifiedName
+		}
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, c)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out
+}
+
+func buildFlowSnapshot(ai *services.ASTIndexer, projectRoot string, node *services.Node, direction string) (*flowTraceSnapshot, error) {
+	if node == nil {
+		return nil, fmt.Errorf("入口符号为空")
+	}
+	query := node.QualifiedName
+	if query == "" {
+		query = node.Name
+	}
+
+	s := &flowTraceSnapshot{Node: node, Direction: direction, NodeKind: flowNodeKind(node.NodeType)}
+	needForward := direction == "forward" || direction == "both"
+	needBackward := direction == "backward" || direction == "both"
+
+	if needForward {
+		forward, err := ai.Analyze(projectRoot, query, "forward")
+		if err != nil {
+			return nil, err
+		}
+		s.Forward = forward
+	}
+	if needBackward {
+		backward, err := ai.Analyze(projectRoot, query, "backward")
+		if err != nil {
+			return nil, err
+		}
+		s.Backward = backward
+	}
+
+	forwardDirect := 0
+	forwardIndirect := 0
+	backwardDirect := 0
+	backwardIndirect := 0
+	complexity := 0.0
+
+	if s.Forward != nil {
+		forwardDirect = len(s.Forward.DirectCallers)
+		forwardIndirect = len(s.Forward.IndirectCallers)
+		complexity = s.Forward.ComplexityScore
+	}
+	if s.Backward != nil {
+		backwardDirect = len(s.Backward.DirectCallers)
+		backwardIndirect = len(s.Backward.IndirectCallers)
+		if complexity == 0 {
+			complexity = s.Backward.ComplexityScore
+		}
+	}
+
+	if s.Backward != nil {
+		for _, c := range s.Backward.DirectCallers {
+			if strings.TrimSpace(c.Node.FilePath) != "" && c.Node.FilePath != node.FilePath {
+				s.ExternalIn++
+			} else {
+				s.InternalIn++
+			}
+		}
+	}
+	if s.Forward != nil {
+		for _, c := range s.Forward.DirectCallers {
+			if strings.TrimSpace(c.Node.FilePath) != "" && c.Node.FilePath != node.FilePath {
+				s.ExternalOut++
+			} else {
+				s.InternalOut++
+			}
+		}
+	}
+
+	if complexity > 40 {
+		complexity = 40
+	}
+	s.Score = float64(
+		s.ExternalIn*50+
+			s.ExternalOut+
+			backwardDirect*8+
+			backwardIndirect*2+
+			forwardDirect*2+
+			forwardIndirect,
+	) + complexity/8.0
+	related := make([]services.CallerInfo, 0)
+	if s.Forward != nil {
+		related = append(related, pickCallers(s.Forward.DirectCallers, 8)...)
+	}
+	if s.Backward != nil {
+		related = append(related, pickCallers(s.Backward.DirectCallers, 8)...)
+	}
+	s.SideEffects = detectSideEffects(node, related)
+	s.Stages = detectStages(node, related)
+
+	return s, nil
+}
+
+func wrapFlowTrace(sm *SessionManager, ai *services.ASTIndexer) server.ToolHandlerFunc {
+	return func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		_ = ctx
+		var args FlowTraceArgs
+		if err := request.BindArguments(&args); err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("参数错误: %v", err)), nil
+		}
+
+		if sm.ProjectRoot == "" {
+			return mcp.NewToolResultError("项目未初始化，请先执行 initialize_project"), nil
+		}
+
+		if strings.TrimSpace(args.SymbolName) == "" && strings.TrimSpace(args.FilePath) == "" {
+			return mcp.NewToolResultError("flow_trace 需要 symbol_name 或 file_path（至少一个）"), nil
+		}
+
+		direction := strings.ToLower(strings.TrimSpace(args.Direction))
+		if direction == "" {
+			direction = "both"
+		}
+		if direction != "backward" && direction != "forward" && direction != "both" {
+			direction = "both"
+		}
+
+		mode := normalizeFlowMode(args.Mode)
+
+		maxNodes := args.MaxNodes
+		if maxNodes <= 0 {
+			maxNodes = 40
+		}
+		if maxNodes > 120 {
+			maxNodes = 120
+		}
+
+		var snapshots []*flowTraceSnapshot
+		allSnapshots := 0
+
+		if strings.TrimSpace(args.SymbolName) != "" {
+			searchResult, err := ai.SearchSymbolWithScope(sm.ProjectRoot, args.SymbolName, args.Scope)
+			if err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("symbol 定位失败: %v", err)), nil
+			}
+			if searchResult == nil || searchResult.FoundSymbol == nil {
+				return mcp.NewToolResultError(fmt.Sprintf("未找到符号: %s", args.SymbolName)), nil
+			}
+			snap, err := buildFlowSnapshot(ai, sm.ProjectRoot, searchResult.FoundSymbol, direction)
+			if err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("flow_trace 失败: %v", err)), nil
+			}
+			snapshots = append(snapshots, snap)
+		} else {
+			// file mode
+			_, _ = ai.IndexScope(sm.ProjectRoot, args.FilePath)
+			mapResult, err := ai.MapProjectWithScope(sm.ProjectRoot, "symbols", args.FilePath)
+			if err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("文件符号提取失败: %v", err)), nil
+			}
+			if mapResult == nil || len(mapResult.Structure) == 0 {
+				return mcp.NewToolResultError(fmt.Sprintf("文件无可追踪符号: %s", args.FilePath)), nil
+			}
+
+			primaryNodes := make([]services.Node, 0)
+			secondaryNodes := make([]services.Node, 0)
+			for _, list := range mapResult.Structure {
+				for _, n := range list {
+					kind := flowNodeKind(n.NodeType)
+					if kind == "callable" {
+						primaryNodes = append(primaryNodes, n)
+					} else if kind == "type" || kind == "module" {
+						secondaryNodes = append(secondaryNodes, n)
+					}
+				}
+			}
+
+			nodes := primaryNodes
+			if len(nodes) == 0 {
+				nodes = secondaryNodes
+			}
+			if len(nodes) == 0 {
+				return mcp.NewToolResultError(fmt.Sprintf("文件中无函数/类符号: %s", args.FilePath)), nil
+			}
+			sort.Slice(nodes, func(i, j int) bool {
+				ki := flowKindPriority(flowNodeKind(nodes[i].NodeType))
+				kj := flowKindPriority(flowNodeKind(nodes[j].NodeType))
+				if ki != kj {
+					return ki < kj
+				}
+				if nodes[i].LineStart == nodes[j].LineStart {
+					return nodes[i].Name < nodes[j].Name
+				}
+				return nodes[i].LineStart < nodes[j].LineStart
+			})
+
+			candidateLimit := 8
+			if mode == "deep" {
+				candidateLimit = 12
+			} else if mode == "brief" {
+				candidateLimit = 6
+			}
+			if len(nodes) < candidateLimit {
+				candidateLimit = len(nodes)
+			}
+			for i := 0; i < candidateLimit; i++ {
+				n := nodes[i]
+				node := n
+				snap, err := buildFlowSnapshot(ai, sm.ProjectRoot, &node, direction)
+				if err == nil {
+					snapshots = append(snapshots, snap)
+				}
+			}
+			allSnapshots = len(snapshots)
+			sort.Slice(snapshots, func(i, j int) bool {
+				if snapshots[i].ExternalIn != snapshots[j].ExternalIn {
+					return snapshots[i].ExternalIn > snapshots[j].ExternalIn
+				}
+				bi := impactDirectCount(snapshots[i].Backward)
+				bj := impactDirectCount(snapshots[j].Backward)
+				if bi != bj {
+					return bi > bj
+				}
+				ii := impactIndirectCount(snapshots[i].Backward)
+				ij := impactIndirectCount(snapshots[j].Backward)
+				if ii != ij {
+					return ii > ij
+				}
+				if snapshots[i].Score == snapshots[j].Score {
+					return snapshots[i].Node.LineStart < snapshots[j].Node.LineStart
+				}
+				return snapshots[i].Score > snapshots[j].Score
+			})
+
+			keep := 2
+			if mode == "brief" {
+				keep = 1
+			} else if mode == "deep" {
+				keep = 4
+			}
+			if len(snapshots) > keep {
+				snapshots = snapshots[:keep]
+			}
+
+			if len(snapshots) == 0 {
+				return mcp.NewToolResultError(fmt.Sprintf("文件流程追踪失败: %s", args.FilePath)), nil
+			}
+		}
+
+		var sb strings.Builder
+		sb.WriteString("### 🔄 业务流程追踪\n\n")
+		sb.WriteString(fmt.Sprintf("**模式**: %s | **视图**: %s | **方向**: %s\n\n", func() string {
+			if strings.TrimSpace(args.SymbolName) != "" {
+				return "symbol"
+			}
+			return "file"
+		}(), mode, direction))
+
+		shownNodes := 0
+		omitted := 0
+
+		for _, snap := range snapshots {
+			n := snap.Node
+			sb.WriteString(fmt.Sprintf("#### 入口 `%s`\n", n.Name))
+			sb.WriteString(fmt.Sprintf("- 类型: `%s` | 位置: `%s:%d` | score=%.1f\n", snap.NodeKind, n.FilePath, n.LineStart, snap.Score))
+			sb.WriteString(fmt.Sprintf("- 跨文件连接: inbound=%d, outbound=%d\n", snap.ExternalIn, snap.ExternalOut))
+
+			upNamesPreview := make([]string, 0)
+			downNamesPreview := make([]string, 0)
+
+			if snap.Backward != nil {
+				upLimit := maxNodes / 4
+				if upLimit < 2 {
+					upLimit = 2
+				}
+				if mode == "deep" {
+					upLimit = maxNodes / 3
+				}
+				upDirect := pickCallers(snap.Backward.DirectCallers, upLimit)
+				upIndirect := pickCallers(snap.Backward.IndirectCallers, upLimit)
+				sb.WriteString(fmt.Sprintf("- 上游影响: direct=%d, indirect=%d, risk=%s\n", len(upDirect), len(upIndirect), snap.Backward.RiskLevel))
+				if len(upDirect) > 0 && mode != "brief" {
+					sb.WriteString("- 上游关键节点: ")
+					names := callerNames(upDirect, upLimit)
+					upNamesPreview = names
+					for i, name := range names {
+						if i > 0 {
+							sb.WriteString(" -> ")
+						}
+						sb.WriteString(fmt.Sprintf("`%s`", name))
+					}
+					sb.WriteString("\n")
+				}
+				shownNodes += len(upDirect) + len(upIndirect)
+				if len(snap.Backward.DirectCallers) > len(upDirect) {
+					omitted += len(snap.Backward.DirectCallers) - len(upDirect)
+				}
+				if len(snap.Backward.IndirectCallers) > len(upIndirect) {
+					omitted += len(snap.Backward.IndirectCallers) - len(upIndirect)
+				}
+			}
+
+			if snap.Forward != nil {
+				downLimit := maxNodes / 4
+				if downLimit < 2 {
+					downLimit = 2
+				}
+				if mode == "deep" {
+					downLimit = maxNodes / 3
+				}
+				downDirect := pickCallers(snap.Forward.DirectCallers, downLimit)
+				downIndirect := pickCallers(snap.Forward.IndirectCallers, downLimit)
+				sb.WriteString(fmt.Sprintf("- 下游依赖: direct=%d, indirect=%d, complexity=%.1f\n", len(downDirect), len(downIndirect), snap.Forward.ComplexityScore))
+				if len(downDirect) > 0 {
+					sb.WriteString("- 下游关键节点: ")
+					names := callerNames(downDirect, downLimit)
+					downNamesPreview = names
+					for i, name := range names {
+						if i > 0 {
+							sb.WriteString(" -> ")
+						}
+						sb.WriteString(fmt.Sprintf("`%s`", name))
+					}
+					sb.WriteString("\n")
+				}
+				shownNodes += len(downDirect) + len(downIndirect)
+				if len(snap.Forward.DirectCallers) > len(downDirect) {
+					omitted += len(snap.Forward.DirectCallers) - len(downDirect)
+				}
+				if len(snap.Forward.IndirectCallers) > len(downIndirect) {
+					omitted += len(snap.Forward.IndirectCallers) - len(downIndirect)
+				}
+			}
+
+			if mode != "brief" {
+				critical := buildCriticalPaths(n.Name, upNamesPreview, downNamesPreview, 3)
+				if len(critical) > 0 {
+					sb.WriteString("- 关键路径Top3:\n")
+					for i, p := range critical {
+						sb.WriteString(fmt.Sprintf("  %d) `%s`\n", i+1, p))
+					}
+				}
+				if len(snap.Stages) > 0 {
+					sb.WriteString(fmt.Sprintf("- 阶段摘要: %s\n", strings.Join(snap.Stages, " -> ")))
+				}
+				if len(snap.SideEffects) > 0 {
+					sb.WriteString(fmt.Sprintf("- 副作用: %s\n", strings.Join(snap.SideEffects, ", ")))
+				}
+			}
+
+			sb.WriteString("\n")
+		}
+
+		sb.WriteString("**建议**:\n")
+		sb.WriteString("- 若要精确改动风险，用 `code_impact(symbol_name=入口函数, direction=backward)` 二次确认。\n")
+		sb.WriteString("- 若输出仍偏长，请缩小 `scope` 到单目录或单文件。\n")
+		sb.WriteString("- 若需更多细节，将 `mode` 提升为 `standard` 或 `deep`。\n")
+
+		if allSnapshots > len(snapshots) {
+			sb.WriteString(fmt.Sprintf("\n_注：文件模式下候选入口较多，已从 %d 个中展示 %d 个高分入口。_\n", allSnapshots, len(snapshots)))
+		}
+		if omitted > 0 || shownNodes > maxNodes {
+			sb.WriteString(fmt.Sprintf("_注：已按输出预算截断，省略约 %d 个节点（max_nodes=%d）。_\n", omitted, maxNodes))
+		}
+
+		return mcp.NewToolResultText(sb.String()), nil
+	}
 }
 
 func wrapImpact(sm *SessionManager, ai *services.ASTIndexer) server.ToolHandlerFunc {
@@ -185,12 +895,74 @@ func wrapProjectMap(sm *SessionManager, ai *services.ASTIndexer) server.ToolHand
 			return mcp.NewToolResultError("项目未初始化，请先执行 initialize_project"), nil
 		}
 
-		// 🆕 【关键】先刷新索引，确保数据最新
-		_, _ = ai.Index(sm.ProjectRoot)
-
 		level := args.Level
 		if level == "" {
 			level = "symbols"
+		}
+
+		if level == "structure" {
+			// 结构视图走 Rust structure 模式，不触发全量符号索引，避免超大 JSON
+			structureResult, err := ai.StructureProjectWithScope(sm.ProjectRoot, args.Scope)
+			if err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("生成结构地图失败: %v", err)), nil
+			}
+
+			type dirCount struct {
+				Path  string
+				Count int
+			}
+			dirs := make([]dirCount, 0, len(structureResult.Structure))
+			for p, info := range structureResult.Structure {
+				dirs = append(dirs, dirCount{Path: p, Count: info.FileCount})
+			}
+			sort.Slice(dirs, func(i, j int) bool {
+				if dirs[i].Count == dirs[j].Count {
+					return dirs[i].Path < dirs[j].Path
+				}
+				return dirs[i].Count > dirs[j].Count
+			})
+
+			var sb strings.Builder
+			sb.WriteString("### 🗺️ 项目地图 (Structure)\n\n")
+			sb.WriteString(fmt.Sprintf("**📊 统计**: %d 文件 | %d 目录\n\n", structureResult.TotalFiles, len(dirs)))
+			if strings.TrimSpace(args.Scope) != "" {
+				sb.WriteString(fmt.Sprintf("**🔎 Scope**: `%s`\n\n", args.Scope))
+			}
+			sb.WriteString("**📁 目录结构** (按文件数排序):\n")
+
+			limit := 120
+			if len(dirs) < limit {
+				limit = len(dirs)
+			}
+			for i := 0; i < limit; i++ {
+				path := dirs[i].Path
+				if path == "" {
+					path = "(root)"
+				}
+				sb.WriteString(fmt.Sprintf("- `%s/` (%d files)\n", path, dirs[i].Count))
+			}
+			if len(dirs) > limit {
+				sb.WriteString(fmt.Sprintf("\n... 其余 %d 个目录已省略，请使用 scope 下钻。\n", len(dirs)-limit))
+			}
+
+			content := sb.String()
+			if len(content) > 2000 {
+				mcpDataDir := filepath.Join(sm.ProjectRoot, ".mcp-data")
+				_ = os.MkdirAll(mcpDataDir, 0755)
+				outputPath := filepath.Join(mcpDataDir, "project_map_structure.md")
+				if err := os.WriteFile(outputPath, []byte(content), 0644); err == nil {
+					return mcp.NewToolResultText(fmt.Sprintf("⚠️ Map 内容较长 (%d chars)，已自动保存到项目文件：\n👉 `%s`\n\n请使用 view_file 查看。", len(content), outputPath)), nil
+				}
+			}
+
+			return mcp.NewToolResultText(content), nil
+		}
+
+		// symbols 视图：优先按范围补录（热点目录），否则按新鲜度检查全量索引
+		if strings.TrimSpace(args.Scope) != "" {
+			_, _ = ai.IndexScope(sm.ProjectRoot, args.Scope)
+		} else {
+			_, _ = ai.EnsureFreshIndex(sm.ProjectRoot)
 		}
 
 		// 调用 AST 服务生成数据
@@ -226,13 +998,7 @@ func wrapProjectMap(sm *SessionManager, ai *services.ASTIndexer) server.ToolHand
 		// 使用 MapRenderer 渲染结果
 		mr := NewMapRenderer(result, sm.ProjectRoot)
 
-		var content string
-		switch level {
-		case "structure":
-			content = mr.RenderOverview()
-		default: // symbols
-			content = mr.RenderStandard()
-		}
+		content := mr.RenderStandard()
 
 		// 🆕 主动接管大输出：如果 > 2000 字符，保存到文件
 		if len(content) > 2000 {

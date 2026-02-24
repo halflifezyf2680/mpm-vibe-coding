@@ -77,8 +77,6 @@ powershell -ExecutionPolicy Bypass -File scripts\build-windows.ps1
 
 指向编译产物：`mcp-server-go/bin/mpm-go(.exe)`
 
-跨平台二进制包配置请看：`QUICKSTART.md`
-
 ### 3. 开始使用
 
 ```text
@@ -86,7 +84,16 @@ powershell -ExecutionPolicy Bypass -File scripts\build-windows.ps1
 帮我分析修复 Login 回调幂等问题的方案
 ```
 
-首次 `mpm 初始化` 会在项目根目录生成 `_MPM_PROJECT_RULES.md`，用于注入项目级规则，让 LLM 更稳定地按你的工程规范工作。
+### 4. 发布打包（按版本号）
+
+```powershell
+python package_product.py 1.3.0
+```
+
+说明：
+
+- 打包目录命名为 `release_v<版本号>/MyProjectManager`
+- 版本号不能为空，且不能包含路径非法字符（如 `/ \ : * ? " < > |`）
 
 ---
 
@@ -94,10 +101,12 @@ powershell -ExecutionPolicy Bypass -File scripts\build-windows.ps1
 
 | 触发词 | 工具 | 用途 |
 |--------|------|------|
-| `mpm 初始化` | `initialize_project` | 项目绑定与 AST 索引 |
+| `mpm 初始化` | `initialize_project` | 项目绑定与 AST 索引（支持 `force_full_index`） |
+| `mpm 索引状态` | `index_status` | 查看后台索引进度/心跳/DB大小 |
 | `mpm 搜索` | `code_search` | AST 精确定位符号 |
 | `mpm 影响` | `code_impact` | 调用链影响分析 |
 | `mpm 地图` | `project_map` | 项目结构 + 热力图 |
+| `mpm 流程` | `flow_trace` | 业务流程追踪（入口/上游/下游） |
 | `mpm 分析` | `manager_analyze` | 任务情报简报 |
 | `mpm 任务链` | `task_chain` | 顺序执行与断点 |
 | `mpm 记录` | `memo` | 变更备忘录 |
@@ -134,10 +143,10 @@ powershell -ExecutionPolicy Bypass -File scripts\build-windows.ps1
 └─────────────────────────────────────────────────────────────┘
                           │
 ┌─────────────────────────▼───────────────────────────────────┐
-│              SQLite (.mcp-data/symbols.db)                  │
-│  • symbols: canonical_id, scope_path, signature             │
-│  • calls: callee_id (精确调用链)                             │
-│  • memos: 跨会话持久记忆                                     │
+│                 SQLite 多库 (.mcp-data/*)                    │
+│  • symbols.db: canonical_id/scope_path/callee_id            │
+│  • mcp_memory.db: memos/tasks/known_facts                    │
+│  • arch-ast.db: revisions/nodes/edges/proposals/events       │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -174,10 +183,21 @@ MPM 的 AST 引擎维护 **精确调用链**：
 ## 文档
 
 - **[MANUAL.md](./docs/MANUAL.md)** - 完整手册（工具详解 + 最佳实践 + Case Study）
-- **[QUICKSTART.md](./QUICKSTART.md)** - 跨平台安装与 MCP 客户端配置
 - **[README_EN.md](./README_EN.md)** - English Version
-- **[QUICKSTART_EN.md](./QUICKSTART_EN.md)** - English Quickstart
 - **[MANUAL_EN.md](./docs/MANUAL_EN.md)** - English Manual
+
+---
+
+## 搜索关键词（SEO）
+
+如果你在 Google / GitHub 搜索以下关键词，这个项目就是对应方案：
+
+- `MCP code intelligence`
+- `AST code impact analysis`
+- `LLM code workflow memory`
+- `code_search code_impact project_map flow_trace`
+- `Rust AST indexer for AI coding`
+- `MCP server for Claude Code / Cursor`
 
 ---
 

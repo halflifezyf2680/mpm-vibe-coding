@@ -8,7 +8,10 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    mpsc, Arc,
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tree_sitter::{Language, Parser as TsParser, Query, QueryCursor};
 
@@ -62,7 +65,7 @@ struct Args {
     #[arg(short, long)]
     line: Option<usize>,
 
-    /// Scope path filter (for map mode)
+    /// Scope path filter (for map/index mode)
     #[arg(long)]
     scope: Option<String>,
 
@@ -73,12 +76,20 @@ struct Args {
     /// Analysis direction: forward, backward, both (for analyze mode)
     #[arg(long, default_value = "backward")]
     direction: String,
+
+    /// Force full parse on huge repositories (disable bootstrap strategy)
+    #[arg(long, default_value_t = false)]
+    force_full: bool,
 }
 
 #[derive(Serialize)]
 struct IndexResult {
     status: String,
     total_files: usize,
+    parsed_files: usize,
+    meta_files: usize,
+    skipped_files: usize,
+    strategy: String,
     elapsed_ms: u128,
 }
 
@@ -89,7 +100,10 @@ struct IndexResult {
 struct ParseResult {
     file_path: String,
     file_hash: String,
+    file_size: u64,
+    file_mtime: i64,
     language: String,
+    index_level: String,
     line_count: usize,
     symbols: Vec<PendingSymbol>,
     calls: Vec<PendingCall>,
@@ -140,8 +154,12 @@ fn init_db(conn: &Connection) -> Result<()> {
             file_id INTEGER PRIMARY KEY AUTOINCREMENT,
             file_path TEXT UNIQUE NOT NULL,
             file_hash TEXT NOT NULL,
+            file_size INTEGER DEFAULT 0,
+            file_mtime INTEGER DEFAULT 0,
             language TEXT DEFAULT 'unknown',
             line_count INTEGER DEFAULT 0,
+            index_level TEXT DEFAULT 'symbol',
+            indexed_at INTEGER DEFAULT 0,
             updated_at INTEGER NOT NULL
         )",
         [],
@@ -235,6 +253,71 @@ fn init_db(conn: &Connection) -> Result<()> {
         println!("[Migration] Added calls.callee_id column");
     }
 
+    // files 增量字段：file_size, file_mtime
+    let file_size_exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('files') WHERE name='file_size'",
+            [],
+            |row| row.get::<_, i32>(0),
+        )
+        .unwrap_or(0)
+        > 0;
+    if !file_size_exists {
+        conn.execute(
+            "ALTER TABLE files ADD COLUMN file_size INTEGER DEFAULT 0",
+            [],
+        )?;
+        println!("[Migration] Added files.file_size column");
+    }
+
+    let file_mtime_exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('files') WHERE name='file_mtime'",
+            [],
+            |row| row.get::<_, i32>(0),
+        )
+        .unwrap_or(0)
+        > 0;
+    if !file_mtime_exists {
+        conn.execute(
+            "ALTER TABLE files ADD COLUMN file_mtime INTEGER DEFAULT 0",
+            [],
+        )?;
+        println!("[Migration] Added files.file_mtime column");
+    }
+
+    let index_level_exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('files') WHERE name='index_level'",
+            [],
+            |row| row.get::<_, i32>(0),
+        )
+        .unwrap_or(0)
+        > 0;
+    if !index_level_exists {
+        conn.execute(
+            "ALTER TABLE files ADD COLUMN index_level TEXT DEFAULT 'symbol'",
+            [],
+        )?;
+        println!("[Migration] Added files.index_level column");
+    }
+
+    let indexed_at_exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('files') WHERE name='indexed_at'",
+            [],
+            |row| row.get::<_, i32>(0),
+        )
+        .unwrap_or(0)
+        > 0;
+    if !indexed_at_exists {
+        conn.execute(
+            "ALTER TABLE files ADD COLUMN indexed_at INTEGER DEFAULT 0",
+            [],
+        )?;
+        println!("[Migration] Added files.indexed_at column");
+    }
+
     // 新增索引（幂等）
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_symbols_scope_path ON symbols(scope_path)",
@@ -296,15 +379,65 @@ fn run_indexer(args: &Args, heartbeat_path: &Path) -> anyhow::Result<()> {
     let _: String = conn
         .query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))
         .unwrap_or_default();
+    // Keep WAL growth bounded on large projects.
+    let _: i64 = conn
+        .query_row("PRAGMA wal_autocheckpoint = 1000", [], |r| r.get(0))
+        .unwrap_or(1000);
 
     // 2. Discover Files
-    let mut builder = WalkBuilder::new(&args.project);
+    let scan_root = if let Some(scope) = &args.scope {
+        let normalized = scope.trim().trim_start_matches("./").trim_matches('/');
+        if normalized.is_empty() {
+            PathBuf::from(&args.project)
+        } else {
+            Path::new(&args.project).join(normalized)
+        }
+    } else {
+        PathBuf::from(&args.project)
+    };
+
+    let mut builder = WalkBuilder::new(&scan_root);
     builder.hidden(false); // Process .git ? No, usually we want to ignore .git
     builder.git_ignore(true); // Respect .gitignore
 
-    if let Some(ignores) = &args.ignore_dirs {
-        let ignore_set: HashSet<String> =
-            ignores.split(',').map(|s| s.trim().to_string()).collect();
+    // Default ignores to avoid indexing third-party/build artifacts even when caller forgets.
+    let default_ignores: HashSet<String> = [
+        ".git",
+        "node_modules",
+        "vendor",
+        "dist",
+        "build",
+        "out",
+        "target",
+        "__pycache__",
+        ".venv",
+        "venv",
+        "site-packages",
+        ".m2",
+        ".gradle",
+        ".idea",
+        ".vscode",
+        "coverage",
+        "_build",
+        ".next",
+        ".nuxt",
+        ".svelte-kit",
+    ]
+    .into_iter()
+    .map(|s| s.to_string())
+    .collect();
+
+    {
+        let mut ignore_set = default_ignores;
+        if let Some(ignores) = &args.ignore_dirs {
+            for s in ignores
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+            {
+                ignore_set.insert(s.to_string());
+            }
+        }
         builder.filter_entry(move |entry| {
             if !entry.file_type().map(|f| f.is_dir()).unwrap_or(false) {
                 return true;
@@ -360,21 +493,73 @@ fn run_indexer(args: &Args, heartbeat_path: &Path) -> anyhow::Result<()> {
 
     println!("Found {} files", entries.len());
 
-    // 4. Pre-load Hashes (Optimization)
-    let mut db_hashes: HashMap<String, String> = HashMap::new();
+    // 4. Pre-load file metadata (Optimization)
+    #[derive(Clone)]
+    struct DbFileMeta {
+        hash: String,
+        size: u64,
+        mtime: i64,
+        level: String,
+    }
+
+    let mut db_files: HashMap<String, DbFileMeta> = HashMap::new();
     {
-        let mut stmt = conn.prepare("SELECT file_path, file_hash FROM files")?;
+        let mut stmt = conn.prepare(
+            "SELECT file_path, file_hash, file_size, file_mtime, index_level FROM files",
+        )?;
         let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2).unwrap_or(0),
+                row.get::<_, i64>(3).unwrap_or(0),
+                row.get::<_, String>(4)
+                    .unwrap_or_else(|_| "symbol".to_string()),
+            ))
         })?;
         for r in rows {
-            if let Ok((path, hash)) = r {
-                db_hashes.insert(path, hash);
+            if let Ok((path, hash, size_i64, mtime, level)) = r {
+                let size = if size_i64 > 0 { size_i64 as u64 } else { 0 };
+                db_files.insert(
+                    path,
+                    DbFileMeta {
+                        hash,
+                        size,
+                        mtime,
+                        level,
+                    },
+                );
             }
         }
     }
 
     let total = entries.len();
+
+    let huge_threshold = std::env::var("MPM_AST_HUGE_FILE_THRESHOLD")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(50_000);
+    let bootstrap_parse_budget = std::env::var("MPM_AST_BOOTSTRAP_MAX_PARSE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(5_000);
+
+    let initial_build = db_files.is_empty();
+    let has_meta_backlog = db_files.values().any(|f| f.level == "meta");
+    let use_bootstrap_strategy =
+        (initial_build && total > huge_threshold) || (has_meta_backlog && total > huge_threshold);
+    let force_full = args.force_full;
+    let strategy = if force_full {
+        "force_full"
+    } else if use_bootstrap_strategy {
+        "bootstrap"
+    } else {
+        "full_or_incremental"
+    };
+    println!(
+        "Index strategy: {} (total_files={}, threshold={}, parse_budget={})",
+        strategy, total, huge_threshold, bootstrap_parse_budget
+    );
 
     // Channel for results
     let (tx_chan, rx_chan) = mpsc::channel::<ParseResult>();
@@ -386,10 +571,22 @@ fn run_indexer(args: &Args, heartbeat_path: &Path) -> anyhow::Result<()> {
 
     // We can spawn a thread to drive the parallel processing, while main thread waits on RX.
     let entries_arc = Arc::new(entries);
-    let db_hashes_arc = Arc::new(db_hashes);
+    let db_files_arc = Arc::new(db_files);
     let project_root = args.project.clone();
+    let parse_counter = Arc::new(AtomicUsize::new(0));
+    let parsed_counter = Arc::new(AtomicUsize::new(0));
+    let meta_counter = Arc::new(AtomicUsize::new(0));
+    let skipped_counter = Arc::new(AtomicUsize::new(0));
+    let parse_counter_worker = Arc::clone(&parse_counter);
+    let parsed_counter_worker = Arc::clone(&parsed_counter);
+    let meta_counter_worker = Arc::clone(&meta_counter);
+    let skipped_counter_worker = Arc::clone(&skipped_counter);
 
     let producer_handle = std::thread::spawn(move || {
+        let parse_counter = parse_counter_worker;
+        let parsed_counter = parsed_counter_worker;
+        let meta_counter = meta_counter_worker;
+        let skipped_counter = skipped_counter_worker;
         entries_arc.par_iter().for_each(|path| {
             let path_str = path
                 .strip_prefix(&project_root)
@@ -397,29 +594,49 @@ fn run_indexer(args: &Args, heartbeat_path: &Path) -> anyhow::Result<()> {
                 .to_string_lossy()
                 .replace("\\", "/");
 
-            // Calc Hash
-            let content = match fs::read_to_string(path) {
-                Ok(c) => c,
-                Err(_) => return, // Skip binary or read error
+            // Fast filters: extension whitelist + supported parser
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+
+            if !allowed_exts.is_empty() {
+                // allowed_exts stores raw extension strings without dot
+                if !allowed_exts.contains(ext.as_str()) {
+                    return;
+                }
+            }
+
+            let (lang, query) = match parsers_arc.get(&ext) {
+                Some(v) => v,
+                None => return,
             };
 
-            let mut hasher = Sha256::new();
-            hasher.update(content.as_bytes());
-            let result = hasher.finalize();
-            let new_hash = hex::encode(result);
+            // Metadata-based skip (avoid reading file content when unchanged)
+            let (file_size, file_mtime) = match fs::metadata(path).and_then(|m| {
+                let size = m.len();
+                let mtime = m
+                    .modified()?
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
+                Ok((size, mtime))
+            }) {
+                Ok(v) => v,
+                Err(_) => return,
+            };
 
-            // Check Skip
-            if let Some(old_hash) = db_hashes_arc.get(&path_str) {
-                if *old_hash == new_hash {
-                    // Start Heartbeat or Progress tick?
-                    // We can send a "Skipped" message if we want fine grained progress,
-                    // but for now we just skip.
-                    // To update progress bar we might want to send a dummy result?
-                    // Let's send a Empty result to count progress.
+            if let Some(old) = db_files_arc.get(&path_str) {
+                if old.level == "symbol" && old.size == file_size && old.mtime == file_mtime {
+                    skipped_counter.fetch_add(1, Ordering::Relaxed);
                     let _ = tx_chan.send(ParseResult {
                         file_path: path_str,
-                        file_hash: new_hash, // Same hash
+                        file_hash: old.hash.clone(),
+                        file_size,
+                        file_mtime,
                         language: "skip".into(),
+                        index_level: old.level.clone(),
                         line_count: 0,
                         symbols: vec![],
                         calls: vec![],
@@ -428,208 +645,248 @@ fn run_indexer(args: &Args, heartbeat_path: &Path) -> anyhow::Result<()> {
                 }
             }
 
-            // Parse
-            let ext = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("")
-                .to_lowercase();
-            if let Some((lang, query)) = parsers_arc.get(&ext) {
-                let mut parser = TsParser::new();
-                parser.set_language(*lang).unwrap();
+            if use_bootstrap_strategy && !force_full {
+                let seen = parse_counter.fetch_add(1, Ordering::Relaxed);
+                if seen >= bootstrap_parse_budget {
+                    meta_counter.fetch_add(1, Ordering::Relaxed);
+                    let _ = tx_chan.send(ParseResult {
+                        file_path: path_str,
+                        file_hash: format!("meta:{}:{}", file_size, file_mtime),
+                        file_size,
+                        file_mtime,
+                        language: "meta".into(),
+                        index_level: "meta".into(),
+                        line_count: 0,
+                        symbols: vec![],
+                        calls: vec![],
+                    });
+                    return;
+                }
+            }
 
-                let tree = parser.parse(&content, None).unwrap(); // handle err?
+            // Read & hash only when needed
+            let content = match fs::read_to_string(path) {
+                Ok(c) => c,
+                Err(_) => return,
+            };
 
-                let mut cursor = QueryCursor::new();
-                let matches = cursor.matches(query, tree.root_node(), content.as_bytes());
+            let mut hasher = Sha256::new();
+            hasher.update(content.as_bytes());
+            let result = hasher.finalize();
+            let new_hash = hex::encode(result);
 
-                let mut symbols = vec![];
-                let mut calls = vec![];
-                let mut node_id_map: HashMap<usize, usize> = HashMap::new(); // tree_node_id -> temp_id
-                let mut temp_counter = 0;
+            // Check Skip by hash (handles metadata-only changes)
+            if let Some(old) = db_files_arc.get(&path_str) {
+                if old.hash == new_hash {
+                    skipped_counter.fetch_add(1, Ordering::Relaxed);
+                    let _ = tx_chan.send(ParseResult {
+                        file_path: path_str,
+                        file_hash: new_hash,
+                        file_size,
+                        file_mtime,
+                        language: "skip".into(),
+                        index_level: old.level.clone(),
+                        line_count: 0,
+                        symbols: vec![],
+                        calls: vec![],
+                    });
+                    return;
+                }
+            }
 
-                for m in matches {
-                    let mut node_name: Option<String> = None;
-                    let mut node_type: Option<&str> = None;
-                    let mut def_node: Option<tree_sitter::Node> = None;
-                    let mut name_node: Option<tree_sitter::Node> = None;
-                    let mut callee_node: Option<tree_sitter::Node> = None;
+            let mut parser = TsParser::new();
+            parser.set_language(*lang).unwrap();
 
-                    for capture in m.captures {
-                        let capture_name = &query.capture_names()[capture.index as usize];
-                        match capture_name.as_str() {
-                            "name" => {
-                                name_node = Some(capture.node);
-                                node_name = Some(
-                                    content[capture.node.start_byte()..capture.node.end_byte()]
-                                        .to_string(),
-                                );
-                            }
-                            "callee" => {
-                                callee_node = Some(capture.node);
-                            }
-                            "def.func" => {
-                                node_type = Some("function");
-                                def_node = Some(capture.node);
-                            }
-                            "def.class" => {
-                                node_type = Some("class");
-                                def_node = Some(capture.node);
-                            }
-                            "ref.call" => {
-                                // Already handled by callee?
-                            }
-                            _ => {}
+            let tree = parser.parse(&content, None).unwrap(); // handle err?
+
+            let mut cursor = QueryCursor::new();
+            let matches = cursor.matches(query, tree.root_node(), content.as_bytes());
+
+            let mut symbols = vec![];
+            let mut calls = vec![];
+            let mut node_id_map: HashMap<usize, usize> = HashMap::new(); // tree_node_id -> temp_id
+            let mut temp_counter = 0;
+
+            for m in matches {
+                let mut node_name: Option<String> = None;
+                let mut node_type: Option<&str> = None;
+                let mut def_node: Option<tree_sitter::Node> = None;
+                let mut name_node: Option<tree_sitter::Node> = None;
+                let mut callee_node: Option<tree_sitter::Node> = None;
+
+                for capture in m.captures {
+                    let capture_name = &query.capture_names()[capture.index as usize];
+                    match capture_name.as_str() {
+                        "name" => {
+                            name_node = Some(capture.node);
+                            node_name = Some(
+                                content[capture.node.start_byte()..capture.node.end_byte()]
+                                    .to_string(),
+                            );
                         }
-                    }
-
-                    if let (Some(name), Some(kind), Some(full_node)) =
-                        (node_name, node_type, def_node)
-                    {
-                        // Definition
-                        let start = full_node.start_position().row + 1;
-                        let end = full_node.end_position().row + 1;
-
-                        temp_counter += 1;
-                        let tid = temp_counter;
-                        node_id_map.insert(full_node.id(), tid);
-
-                        // Find parent temp_id
-                        let mut parent_temp_id = None;
-                        let mut p_cursor = full_node.parent();
-                        while let Some(p) = p_cursor {
-                            if let Some(pid) = node_id_map.get(&p.id()) {
-                                parent_temp_id = Some(*pid);
-                                break;
-                            }
-                            p_cursor = p.parent();
+                        "callee" => {
+                            callee_node = Some(capture.node);
                         }
-
-                        // 🆕 构建 scope_path：沿 parent() 回溯收集类/模块名
-                        let mut scope_parts: Vec<String> = Vec::new();
-                        let mut scope_cursor = full_node.parent();
-                        while let Some(p) = scope_cursor {
-                            // 检查父节点是否是 class 或 module（通过 child 名为 name 的捕获）
-                            let node_kind = p.kind();
-                            if node_kind == "class_definition"
-                                || node_kind == "class"
-                                || node_kind == "function_definition"
-                                || node_kind == "method_declaration"
-                                || node_kind == "class_declaration"
-                                || node_kind == "interface_declaration"
-                                || node_kind == "struct_item"
-                                || node_kind == "impl_item"
-                                || node_kind == "mod_item"
-                                || node_kind == "trait_item"
-                            {
-                                // 尝试从子节点中找 name
-                                for i in 0..p.child_count() {
-                                    let child = p.child(i).unwrap();
-                                    let child_kind = child.kind();
-                                    if child_kind == "identifier"
-                                        || child_kind == "type_identifier"
-                                        || child_kind == "name"
-                                        || child_kind == "field_identifier"
-                                    {
-                                        let parent_name =
-                                            &content[child.start_byte()..child.end_byte()];
-                                        if parent_name != &name {
-                                            scope_parts.push(parent_name.to_string());
-                                        }
-                                        break;
-                                    }
-                                }
-                            }
-                            scope_cursor = p.parent();
+                        "def.func" => {
+                            node_type = Some("function");
+                            def_node = Some(capture.node);
                         }
-                        scope_parts.reverse();
-                        let scope_path = if scope_parts.is_empty() {
-                            name.clone()
-                        } else {
-                            format!("{}::{}", scope_parts.join("::"), name)
-                        };
-
-                        symbols.push(PendingSymbol {
-                            temp_id: tid,
-                            parent_temp_id,
-                            name: name.clone(),
-                            qualified_name: scope_path.clone(),
-                            scope_path,
-                            symbol_type: kind.to_string(),
-                            line_start: start,
-                            line_end: end,
-                            text: name,
-                            signature: if kind == "function" {
-                                let sig_text =
-                                    &content[full_node.start_byte()..full_node.end_byte()];
-                                sig_text.lines().next().map(|s| s.trim().to_string())
-                            } else {
-                                None
-                            },
-                        });
-                    } else if let Some(c_node) = callee_node {
-                        // Call
-                        let callee_name =
-                            content[c_node.start_byte()..c_node.end_byte()].to_string();
-                        // Find caller
-                        let mut p_cursor = c_node.parent();
-                        let mut caller_tid = 0;
-                        let line = c_node.start_position().row + 1;
-
-                        while let Some(p) = p_cursor {
-                            if let Some(pid) = node_id_map.get(&p.id()) {
-                                caller_tid = *pid;
-                                break;
-                            }
-                            p_cursor = p.parent();
+                        "def.class" => {
+                            node_type = Some("class");
+                            def_node = Some(capture.node);
                         }
-
-                        if caller_tid > 0 {
-                            calls.push(PendingCall {
-                                caller_temp_id: caller_tid,
-                                callee_name,
-                                line,
-                            });
+                        "ref.call" => {
+                            // Already handled by callee?
                         }
+                        _ => {}
                     }
                 }
 
-                let line_count = content.lines().count();
+                if let (Some(name), Some(kind), Some(full_node)) = (node_name, node_type, def_node)
+                {
+                    // Definition
+                    let start = full_node.start_position().row + 1;
+                    let end = full_node.end_position().row + 1;
 
-                let _ = tx_chan.send(ParseResult {
-                    file_path: path_str,
-                    file_hash: new_hash,
-                    language: ext,
-                    line_count,
-                    symbols,
-                    calls,
-                });
+                    temp_counter += 1;
+                    let tid = temp_counter;
+                    node_id_map.insert(full_node.id(), tid);
+
+                    // Find parent temp_id
+                    let mut parent_temp_id = None;
+                    let mut p_cursor = full_node.parent();
+                    while let Some(p) = p_cursor {
+                        if let Some(pid) = node_id_map.get(&p.id()) {
+                            parent_temp_id = Some(*pid);
+                            break;
+                        }
+                        p_cursor = p.parent();
+                    }
+
+                    // 🆕 构建 scope_path：沿 parent() 回溯收集类/模块名
+                    let mut scope_parts: Vec<String> = Vec::new();
+                    let mut scope_cursor = full_node.parent();
+                    while let Some(p) = scope_cursor {
+                        // 检查父节点是否是 class 或 module（通过 child 名为 name 的捕获）
+                        let node_kind = p.kind();
+                        if node_kind == "class_definition"
+                            || node_kind == "class"
+                            || node_kind == "function_definition"
+                            || node_kind == "method_declaration"
+                            || node_kind == "class_declaration"
+                            || node_kind == "interface_declaration"
+                            || node_kind == "struct_item"
+                            || node_kind == "impl_item"
+                            || node_kind == "mod_item"
+                            || node_kind == "trait_item"
+                        {
+                            // 尝试从子节点中找 name
+                            for i in 0..p.child_count() {
+                                let child = p.child(i).unwrap();
+                                let child_kind = child.kind();
+                                if child_kind == "identifier"
+                                    || child_kind == "type_identifier"
+                                    || child_kind == "name"
+                                    || child_kind == "field_identifier"
+                                {
+                                    let parent_name =
+                                        &content[child.start_byte()..child.end_byte()];
+                                    if parent_name != &name {
+                                        scope_parts.push(parent_name.to_string());
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                        scope_cursor = p.parent();
+                    }
+                    scope_parts.reverse();
+                    let scope_path = if scope_parts.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{}::{}", scope_parts.join("::"), name)
+                    };
+
+                    symbols.push(PendingSymbol {
+                        temp_id: tid,
+                        parent_temp_id,
+                        name: name.clone(),
+                        qualified_name: scope_path.clone(),
+                        scope_path,
+                        symbol_type: kind.to_string(),
+                        line_start: start,
+                        line_end: end,
+                        text: name,
+                        signature: if kind == "function" {
+                            let sig_text = &content[full_node.start_byte()..full_node.end_byte()];
+                            sig_text.lines().next().map(|s| s.trim().to_string())
+                        } else {
+                            None
+                        },
+                    });
+                } else if let Some(c_node) = callee_node {
+                    // Call
+                    let callee_name = content[c_node.start_byte()..c_node.end_byte()].to_string();
+                    // Find caller
+                    let mut p_cursor = c_node.parent();
+                    let mut caller_tid = 0;
+                    let line = c_node.start_position().row + 1;
+
+                    while let Some(p) = p_cursor {
+                        if let Some(pid) = node_id_map.get(&p.id()) {
+                            caller_tid = *pid;
+                            break;
+                        }
+                        p_cursor = p.parent();
+                    }
+
+                    if caller_tid > 0 {
+                        calls.push(PendingCall {
+                            caller_temp_id: caller_tid,
+                            callee_name,
+                            line,
+                        });
+                    }
+                }
             }
+
+            let line_count = content.lines().count();
+            parsed_counter.fetch_add(1, Ordering::Relaxed);
+
+            let _ = tx_chan.send(ParseResult {
+                file_path: path_str,
+                file_hash: new_hash,
+                file_size,
+                file_mtime,
+                language: ext,
+                index_level: "symbol".into(),
+                line_count,
+                symbols,
+                calls,
+            });
         });
     });
 
     // 6. Consumer (Main Thread)
+    let batch_size: usize = 300;
     let mut tx = conn.transaction()?;
 
-    // Prepared Statements
-    let mut stmt_upsert_file = tx.prepare(
-        "INSERT INTO files (file_path, file_hash, language, line_count, updated_at) 
-         VALUES (?1, ?2, ?3, ?4, ?5)
-         ON CONFLICT(file_path) DO UPDATE SET file_hash=?2, updated_at=?5",
-    )?;
-
-    let mut stmt_del_symbols = tx.prepare("DELETE FROM symbols WHERE file_id = ?1")?;
-
-    // 🆕 修改：包含 canonical_id、scope_path 和 signature 字段
-    let mut stmt_ins_symbol = tx.prepare(
+    let upsert_file_sql =
+        "INSERT INTO files (file_path, file_hash, file_size, file_mtime, language, line_count, index_level, indexed_at, updated_at) 
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         ON CONFLICT(file_path) DO UPDATE SET file_hash=?2, file_size=?3, file_mtime=?4, language=?5, line_count=?6, index_level=?7, indexed_at=?8, updated_at=?9";
+    let ins_symbol_sql =
         "INSERT INTO symbols (file_id, name, qualified_name, canonical_id, scope_path, symbol_type, line_start, line_end, signature)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"
-    )?;
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)";
 
+    let mut stmt_upsert_file = tx.prepare(upsert_file_sql)?;
+    let mut stmt_del_symbols = tx.prepare("DELETE FROM symbols WHERE file_id = ?1")?;
+    let mut stmt_ins_symbol = tx.prepare(ins_symbol_sql)?;
     let mut stmt_ins_call =
         tx.prepare("INSERT INTO calls (caller_id, callee_name, call_line) VALUES (?1, ?2, ?3)")?;
 
     let mut processed_count = 0;
+    let mut changed_in_batch = 0;
 
     // Process results
     for res in rx_chan {
@@ -661,37 +918,59 @@ fn run_indexer(args: &Args, heartbeat_path: &Path) -> anyhow::Result<()> {
 
         // 1. Upsert File
         stmt_upsert_file.execute(params![
-            res.file_path,
-            res.file_hash,
-            res.language,
+            &res.file_path,
+            &res.file_hash,
+            res.file_size as i64,
+            res.file_mtime,
+            &res.language,
             res.line_count,
+            &res.index_level,
+            if res.index_level == "symbol" { now } else { 0 },
             now
         ])?;
 
-        // Get File ID
-        // Problem: Upsert doesn't always return ID in sqlite < 3.35 with RETURNING
-        // We can look it up. Or use last_insert_rowid if it was an insert.
-        // Or select it. Selection is safer.
-        // Actually since we have a unique path, just select.
-        // Optimization: In a massive transaction, Select might be slow?
-        // We can cache file_id in memory if needed.
-        // Let's do a quick select.
+        // 2. Lookup file id
         let file_id: i64 = tx.query_row(
             "SELECT file_id FROM files WHERE file_path = ?1",
             [&res.file_path],
             |r| r.get(0),
         )?;
 
-        // 2. Clear Old Symbols
+        // 3. Replace symbols/calls for this file
+        // meta level means metadata-only bootstrap: remove stale symbols and continue.
         stmt_del_symbols.execute(params![file_id])?;
+        if res.index_level == "meta" {
+            changed_in_batch += 1;
+            if changed_in_batch >= batch_size {
+                drop(stmt_upsert_file);
+                drop(stmt_del_symbols);
+                drop(stmt_ins_symbol);
+                drop(stmt_ins_call);
+                tx.commit()?;
 
-        // 3. Insert Symbols
-        // We need to map temp_id -> realtime_db_id
+                let _ = conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, i64>(2)?,
+                    ))
+                });
+
+                tx = conn.transaction()?;
+                stmt_upsert_file = tx.prepare(upsert_file_sql)?;
+                stmt_del_symbols = tx.prepare("DELETE FROM symbols WHERE file_id = ?1")?;
+                stmt_ins_symbol = tx.prepare(ins_symbol_sql)?;
+                stmt_ins_call = tx.prepare(
+                    "INSERT INTO calls (caller_id, callee_name, call_line) VALUES (?1, ?2, ?3)",
+                )?;
+                changed_in_batch = 0;
+            }
+            continue;
+        }
+
         let mut temp_to_db_id: HashMap<usize, i64> = HashMap::new();
 
         for sym in &res.symbols {
-            // 🆕 构建规范 canonical_id：type:file_path::name
-            // 例如：func:src/core/session.py::get_task
             let prefix = if sym.symbol_type == "class" {
                 "class"
             } else {
@@ -715,11 +994,36 @@ fn run_indexer(args: &Args, heartbeat_path: &Path) -> anyhow::Result<()> {
             temp_to_db_id.insert(sym.temp_id, db_id);
         }
 
-        // 4. Insert Calls
         for call in &res.calls {
             if let Some(caller_db_id) = temp_to_db_id.get(&call.caller_temp_id) {
                 stmt_ins_call.execute(params![*caller_db_id, call.callee_name, call.line])?;
             }
+        }
+
+        changed_in_batch += 1;
+        if changed_in_batch >= batch_size {
+            drop(stmt_upsert_file);
+            drop(stmt_del_symbols);
+            drop(stmt_ins_symbol);
+            drop(stmt_ins_call);
+            tx.commit()?;
+
+            let _ = conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            });
+
+            tx = conn.transaction()?;
+            stmt_upsert_file = tx.prepare(upsert_file_sql)?;
+            stmt_del_symbols = tx.prepare("DELETE FROM symbols WHERE file_id = ?1")?;
+            stmt_ins_symbol = tx.prepare(ins_symbol_sql)?;
+            stmt_ins_call = tx.prepare(
+                "INSERT INTO calls (caller_id, callee_name, call_line) VALUES (?1, ?2, ?3)",
+            )?;
+            changed_in_batch = 0;
         }
     }
 
@@ -729,13 +1033,15 @@ fn run_indexer(args: &Args, heartbeat_path: &Path) -> anyhow::Result<()> {
     drop(stmt_del_symbols);
     drop(stmt_ins_symbol);
     drop(stmt_ins_call);
+    tx.commit()?;
 
     // ========================================================================
     // 🆕 Phase: Linking calls.callee_id（阶段 B）
     // 规则：同文件优先；无匹配时保持 NULL
     // ========================================================================
+    let mut final_tx = conn.transaction()?;
     {
-        let linked = tx.execute(
+        let linked = final_tx.execute(
             "UPDATE calls
              SET callee_id = (
                  SELECT s2.canonical_id
@@ -757,7 +1063,7 @@ fn run_indexer(args: &Args, heartbeat_path: &Path) -> anyhow::Result<()> {
     // ========================================================================
     {
         let project_path = Path::new(&args.project);
-        let mut stmt = tx.prepare("SELECT file_id, file_path FROM files")?;
+        let mut stmt = final_tx.prepare("SELECT file_id, file_path FROM files")?;
         let rows: Vec<(i64, String)> = stmt
             .query_map([], |row| {
                 Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
@@ -770,8 +1076,8 @@ fn run_indexer(args: &Args, heartbeat_path: &Path) -> anyhow::Result<()> {
             let full_path = project_path.join(&rel_path);
             if !full_path.exists() {
                 // File was deleted from filesystem, remove from index
-                tx.execute("DELETE FROM symbols WHERE file_id = ?1", params![file_id])?;
-                tx.execute("DELETE FROM files WHERE file_id = ?1", params![file_id])?;
+                final_tx.execute("DELETE FROM symbols WHERE file_id = ?1", params![file_id])?;
+                final_tx.execute("DELETE FROM files WHERE file_id = ?1", params![file_id])?;
                 deleted_count += 1;
             }
         }
@@ -784,14 +1090,34 @@ fn run_indexer(args: &Args, heartbeat_path: &Path) -> anyhow::Result<()> {
         }
     }
 
-    tx.commit()?;
+    final_tx.commit()?;
 
-    println!("Indexing completed. Processed {} files.", processed_count);
+    // Final checkpoint after full pass.
+    let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, i64>(2)?,
+        ))
+    });
+
+    let parsed_files = parsed_counter.load(Ordering::Relaxed);
+    let meta_files = meta_counter.load(Ordering::Relaxed);
+    let skipped_files = skipped_counter.load(Ordering::Relaxed);
+
+    println!(
+        "Indexing completed. Processed {} files. parsed={}, meta={}, skipped={}, strategy={}",
+        processed_count, parsed_files, meta_files, skipped_files, strategy
+    );
     // Write Output
     if let Some(out_path) = &args.output {
         let result = IndexResult {
             status: "success".into(),
             total_files: total,
+            parsed_files,
+            meta_files,
+            skipped_files,
+            strategy: strategy.to_string(),
             elapsed_ms: 0,
         };
         let f = fs::File::create(out_path)?;
@@ -2144,15 +2470,60 @@ fn run_structure(args: &Args) -> anyhow::Result<()> {
     // 快速目录扫描，不做任何 AST 解析
     let project_path = Path::new(&args.project);
 
+    let scan_root = if let Some(scope) = &args.scope {
+        let normalized = scope.trim().trim_start_matches("./").trim_matches('/');
+        if normalized.is_empty() {
+            PathBuf::from(&args.project)
+        } else {
+            project_path.join(normalized)
+        }
+    } else {
+        PathBuf::from(&args.project)
+    };
+
     // 构建目录遍历器
-    let mut builder = WalkBuilder::new(&args.project);
+    let mut builder = WalkBuilder::new(&scan_root);
     builder.hidden(false);
     builder.git_ignore(true);
 
-    // 应用忽略目录过滤
-    if let Some(ignores) = &args.ignore_dirs {
-        let ignore_set: HashSet<String> =
-            ignores.split(',').map(|s| s.trim().to_string()).collect();
+    // 应用忽略目录过滤（包含默认忽略）
+    let default_ignores: HashSet<String> = [
+        ".git",
+        "node_modules",
+        "vendor",
+        "dist",
+        "build",
+        "out",
+        "target",
+        "__pycache__",
+        ".venv",
+        "venv",
+        "site-packages",
+        ".m2",
+        ".gradle",
+        ".idea",
+        ".vscode",
+        "coverage",
+        "_build",
+        ".next",
+        ".nuxt",
+        ".svelte-kit",
+    ]
+    .into_iter()
+    .map(|s| s.to_string())
+    .collect();
+
+    {
+        let mut ignore_set = default_ignores;
+        if let Some(ignores) = &args.ignore_dirs {
+            for s in ignores
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+            {
+                ignore_set.insert(s.to_string());
+            }
+        }
         builder.filter_entry(move |entry| {
             if !entry.file_type().map(|f| f.is_dir()).unwrap_or(false) {
                 return true;
@@ -2173,6 +2544,8 @@ fn run_structure(args: &Args) -> anyhow::Result<()> {
         .unwrap_or_default();
 
     // 收集文件，按目录分组
+    let include_files = args.detail == "full";
+    let file_list_limit: usize = 50;
     let mut structure: HashMap<String, DirInfo> = HashMap::new();
     let mut total_files = 0;
 
@@ -2211,7 +2584,9 @@ fn run_structure(args: &Args) -> anyhow::Result<()> {
                     files: vec![],
                 });
                 dir_info.file_count += 1;
-                dir_info.files.push(file_name);
+                if include_files && dir_info.files.len() < file_list_limit {
+                    dir_info.files.push(file_name);
+                }
                 total_files += 1;
             }
         }

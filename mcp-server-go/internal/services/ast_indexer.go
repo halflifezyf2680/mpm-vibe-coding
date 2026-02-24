@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -9,7 +10,10 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -44,6 +48,19 @@ type MapResult struct {
 	Structure     map[string][]Node  `json:"structure"`
 	Elapsed       string             `json:"elapsed"`
 	ComplexityMap map[string]float64 `json:"complexity_map,omitempty"` // 符号名 -> 复杂度分数
+}
+
+// StructureDirInfo 目录结构信息（--mode structure）
+type StructureDirInfo struct {
+	FileCount int      `json:"file_count"`
+	Files     []string `json:"files"`
+}
+
+// StructureResult 目录结构结果（--mode structure）
+type StructureResult struct {
+	Status     string                      `json:"status"`
+	TotalFiles int                         `json:"total_files"`
+	Structure  map[string]StructureDirInfo `json:"structure"`
 }
 
 // CandidateMatch 候选匹配
@@ -85,9 +102,13 @@ type ImpactResult struct {
 
 // IndexResult 索引结果 (--mode index)
 type IndexResult struct {
-	Status     string `json:"status"`
-	TotalFiles int    `json:"total_files"`
-	ElapsedMs  int64  `json:"elapsed_ms"`
+	Status       string `json:"status"`
+	TotalFiles   int    `json:"total_files"`
+	ParsedFiles  int    `json:"parsed_files,omitempty"`
+	MetaFiles    int    `json:"meta_files,omitempty"`
+	SkippedFiles int    `json:"skipped_files,omitempty"`
+	Strategy     string `json:"strategy,omitempty"`
+	ElapsedMs    int64  `json:"elapsed_ms"`
 }
 
 // NamingAnalysis 命名风格分析结果
@@ -109,11 +130,23 @@ type NamingAnalysis struct {
 
 // ASTIndexer AST 索引器服务
 type ASTIndexer struct {
-	BinaryPath string
+	BinaryPath  string
+	indexMu     sync.Mutex
+	lastIndexAt map[string]time.Time
 }
+
+const defaultIndexFreshness = 5 * time.Minute
+const defaultIndexCommandTimeout = 30 * time.Minute
 
 // NewASTIndexer 创建 AST 索引器
 func NewASTIndexer() *ASTIndexer {
+	newIndexer := func(path string) *ASTIndexer {
+		return &ASTIndexer{
+			BinaryPath:  path,
+			lastIndexAt: make(map[string]time.Time),
+		}
+	}
+
 	exeName := "ast_indexer.exe"
 	if runtime.GOOS != "windows" {
 		exeName = "ast_indexer"
@@ -126,12 +159,12 @@ func NewASTIndexer() *ASTIndexer {
 		// 尝试在同级 bin 目录查找
 		binPath := filepath.Join(execDir, "bin", exeName)
 		if fileExists(binPath) {
-			return &ASTIndexer{BinaryPath: binPath}
+			return newIndexer(binPath)
 		}
 		// 尝试同级目录
 		sameDirPath := filepath.Join(execDir, exeName)
 		if fileExists(sameDirPath) {
-			return &ASTIndexer{BinaryPath: sameDirPath}
+			return newIndexer(sameDirPath)
 		}
 	}
 
@@ -144,11 +177,101 @@ func NewASTIndexer() *ASTIndexer {
 	for _, p := range paths {
 		abs, _ := filepath.Abs(p)
 		if fileExists(abs) {
-			return &ASTIndexer{BinaryPath: abs}
+			return newIndexer(abs)
 		}
 	}
 
-	return &ASTIndexer{BinaryPath: exeName}
+	return newIndexer(exeName)
+}
+
+func normalizeProjectRoot(projectRoot string) string {
+	absRoot, err := filepath.Abs(projectRoot)
+	if err != nil {
+		return projectRoot
+	}
+	return absRoot
+}
+
+func getIndexCommandTimeout() time.Duration {
+	raw := strings.TrimSpace(os.Getenv("MPM_AST_INDEX_TIMEOUT_SECONDS"))
+	if raw == "" {
+		return defaultIndexCommandTimeout
+	}
+	sec, err := strconv.Atoi(raw)
+	if err != nil || sec <= 0 {
+		return defaultIndexCommandTimeout
+	}
+	return time.Duration(sec) * time.Second
+}
+
+func (ai *ASTIndexer) markIndexFresh(projectRoot string) {
+	root := normalizeProjectRoot(projectRoot)
+	ai.indexMu.Lock()
+	ai.lastIndexAt[root] = time.Now()
+	ai.indexMu.Unlock()
+}
+
+func (ai *ASTIndexer) shouldSkipIndex(projectRoot string, maxAge time.Duration) bool {
+	root := normalizeProjectRoot(projectRoot)
+
+	ai.indexMu.Lock()
+	if ts, ok := ai.lastIndexAt[root]; ok && time.Since(ts) < maxAge {
+		ai.indexMu.Unlock()
+		return true
+	}
+	ai.indexMu.Unlock()
+
+	info, err := os.Stat(getDBPath(root))
+	if err != nil {
+		return false
+	}
+	if time.Since(info.ModTime()) >= maxAge {
+		return false
+	}
+
+	if !hasUsableIndex(getDBPath(root)) {
+		return false
+	}
+
+	ai.indexMu.Lock()
+	ai.lastIndexAt[root] = time.Now()
+	ai.indexMu.Unlock()
+	return true
+}
+
+func (ai *ASTIndexer) EnsureFreshIndex(projectRoot string) (*IndexResult, error) {
+	if ai.shouldSkipIndex(projectRoot, defaultIndexFreshness) {
+		return &IndexResult{Status: "cached"}, nil
+	}
+	return ai.Index(projectRoot)
+}
+
+func hasUsableIndex(dbPath string) bool {
+	info, err := os.Stat(dbPath)
+	if err != nil || info.Size() <= 0 {
+		return false
+	}
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		return false
+	}
+	defer db.Close()
+
+	var filesTableCount int
+	if err := db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='files'").Scan(&filesTableCount); err != nil {
+		return false
+	}
+	if filesTableCount == 0 {
+		return false
+	}
+
+	var fileCount int
+	if err := db.QueryRow("SELECT COUNT(*) FROM files").Scan(&fileCount); err != nil {
+		return false
+	}
+
+	return fileCount > 0
 }
 
 func fileExists(path string) bool {
@@ -446,6 +569,56 @@ func (ai *ASTIndexer) MapProject(projectRoot string, detail string) (*MapResult,
 	return ai.MapProjectWithScope(projectRoot, detail, "")
 }
 
+// StructureProjectWithScope 快速目录结构扫描（--mode structure，不依赖符号索引）
+func (ai *ASTIndexer) StructureProjectWithScope(projectRoot string, scope string) (*StructureResult, error) {
+	dbPath := getDBPath(projectRoot)
+	outputPath := getOutputPath(projectRoot, "structure")
+	_, ignoreDirs := detectTechStackAndConfig(projectRoot)
+
+	_ = os.Remove(outputPath)
+
+	if scope == "." || scope == "./" {
+		scope = ""
+	}
+
+	args := []string{
+		"--mode", "structure",
+		"--project", projectRoot,
+		"--db", dbPath,
+		"--output", outputPath,
+		"--detail", "standard",
+	}
+	if scope != "" {
+		args = append(args, "--scope", scope)
+	}
+	if ignoreDirs != "" {
+		args = append(args, "--ignore-dirs", ignoreDirs)
+	}
+
+	cmd := exec.Command(ai.BinaryPath, args...)
+	cmd.Dir = projectRoot
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		msg := strings.TrimSpace(string(output))
+		if msg != "" {
+			return nil, fmt.Errorf("目录结构扫描失败: %v: %s", err, msg)
+		}
+		return nil, fmt.Errorf("目录结构扫描失败: %v", err)
+	}
+
+	data, err := os.ReadFile(outputPath)
+	if err != nil {
+		return nil, fmt.Errorf("读取目录结构结果失败: %v", err)
+	}
+
+	var result StructureResult
+	if err := json.Unmarshal(data, &result); err != nil {
+		return nil, fmt.Errorf("解析目录结构结果失败: %v", err)
+	}
+
+	return &result, nil
+}
+
 // MapProjectWithScope 带范围的项目地图
 func (ai *ASTIndexer) MapProjectWithScope(projectRoot string, detail string, scope string) (*MapResult, error) {
 	dbPath := getDBPath(projectRoot)
@@ -597,7 +770,7 @@ func (ai *ASTIndexer) GetSymbolAtLine(projectRoot string, filePath string, line 
 // Analyze 执行影响分析 (--mode analyze)
 func (ai *ASTIndexer) Analyze(projectRoot string, symbol string, direction string) (*ImpactResult, error) {
 	// 先确保索引是最新的
-	_, _ = ai.Index(projectRoot)
+	_, _ = ai.EnsureFreshIndex(projectRoot)
 
 	dbPath := getDBPath(projectRoot)
 	outputPath := getOutputPath(projectRoot, "analyze")
@@ -638,9 +811,20 @@ func (ai *ASTIndexer) Analyze(projectRoot string, symbol string, direction strin
 }
 
 func (ai *ASTIndexer) runIndexCommand(projectRoot string, args []string) error {
-	cmd := exec.Command(ai.BinaryPath, args...)
+	timeout := getIndexCommandTimeout()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, ai.BinaryPath, args...)
 	cmd.Dir = projectRoot
 	output, err := cmd.CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		msg := strings.TrimSpace(string(output))
+		if msg != "" {
+			return fmt.Errorf("索引命令超时(%s): %s", timeout, msg)
+		}
+		return fmt.Errorf("索引命令超时(%s)", timeout)
+	}
 	if err != nil {
 		msg := strings.TrimSpace(string(output))
 		if msg != "" {
@@ -651,12 +835,18 @@ func (ai *ASTIndexer) runIndexCommand(projectRoot string, args []string) error {
 	return nil
 }
 
-func buildIndexArgs(projectRoot, dbPath, outputPath, ignoreDirs, extensions string, useExtensions bool) []string {
+func buildIndexArgs(projectRoot, dbPath, outputPath, ignoreDirs, extensions, scope string, useExtensions bool, forceFull bool) []string {
 	args := []string{
 		"--mode", "index",
 		"--project", projectRoot,
 		"--db", dbPath,
 		"--output", outputPath,
+	}
+	if forceFull {
+		args = append(args, "--force-full")
+	}
+	if scope != "" {
+		args = append(args, "--scope", scope)
 	}
 	if ignoreDirs != "" {
 		args = append(args, "--ignore-dirs", ignoreDirs)
@@ -669,6 +859,15 @@ func buildIndexArgs(projectRoot, dbPath, outputPath, ignoreDirs, extensions stri
 
 // Index 刷新索引 (--mode index)
 func (ai *ASTIndexer) Index(projectRoot string) (*IndexResult, error) {
+	return ai.indexWithOptions(projectRoot, "", false)
+}
+
+// IndexFull 强制全量索引（禁用 bootstrap）
+func (ai *ASTIndexer) IndexFull(projectRoot string) (*IndexResult, error) {
+	return ai.indexWithOptions(projectRoot, "", true)
+}
+
+func (ai *ASTIndexer) indexWithOptions(projectRoot string, scope string, forceFull bool) (*IndexResult, error) {
 	dbPath := getDBPath(projectRoot)
 	outputPath := getOutputPath(projectRoot, "index")
 
@@ -682,12 +881,12 @@ func (ai *ASTIndexer) Index(projectRoot string) (*IndexResult, error) {
 	extensions, ignoreDirs := detectTechStackAndConfig(projectRoot)
 
 	// 第一阶段：默认全量扫描（不传 --extensions），让 Rust 端按真实文件扩展自适应
-	args := buildIndexArgs(projectRoot, dbPath, outputPath, ignoreDirs, extensions, false)
+	args := buildIndexArgs(projectRoot, dbPath, outputPath, ignoreDirs, extensions, scope, false, forceFull)
 	if err := ai.runIndexCommand(projectRoot, args); err != nil {
 		// 第二阶段：仅在全量扫描失败时，退回到扩展白名单模式
 		if extensions != "" {
 			_ = os.Remove(outputPath)
-			retryArgs := buildIndexArgs(projectRoot, dbPath, outputPath, ignoreDirs, extensions, true)
+			retryArgs := buildIndexArgs(projectRoot, dbPath, outputPath, ignoreDirs, extensions, scope, true, forceFull)
 			if retryErr := ai.runIndexCommand(projectRoot, retryArgs); retryErr != nil {
 				return nil, fmt.Errorf("索引刷新失败: 全量扫描失败(%v); 扩展模式重试失败(%v)", err, retryErr)
 			}
@@ -700,21 +899,35 @@ func (ai *ASTIndexer) Index(projectRoot string) (*IndexResult, error) {
 	data, err := os.ReadFile(outputPath)
 	if err != nil {
 		// 索引可能不输出文件，返回默认结果
-		return &IndexResult{Status: "success"}, nil
+		result := &IndexResult{Status: "success"}
+		ai.markIndexFresh(projectRoot)
+		return result, nil
 	}
 
 	var result IndexResult
 	if err := json.Unmarshal(data, &result); err != nil {
-		return &IndexResult{Status: "success"}, nil
+		fallback := &IndexResult{Status: "success"}
+		ai.markIndexFresh(projectRoot)
+		return fallback, nil
 	}
 
+	ai.markIndexFresh(projectRoot)
 	return &result, nil
+}
+
+// IndexScope 按目录范围增量刷新索引（用于热点补录）
+func (ai *ASTIndexer) IndexScope(projectRoot string, scope string) (*IndexResult, error) {
+	scope = strings.TrimSpace(scope)
+	if scope == "" || scope == "." || scope == "./" {
+		return ai.Index(projectRoot)
+	}
+	return ai.indexWithOptions(projectRoot, scope, false)
 }
 
 // AnalyzeNamingStyle 分析项目命名风格
 func (ai *ASTIndexer) AnalyzeNamingStyle(projectRoot string) (*NamingAnalysis, error) {
 	// 1. 确保索引存在 (且尝试刷新)
-	if _, err := ai.Index(projectRoot); err != nil {
+	if _, err := ai.EnsureFreshIndex(projectRoot); err != nil {
 		// 如果索引失败，尝试直接读取现有数据库
 		// 什么也不做
 	}

@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"mcp-server-go/internal/core"
 	"mcp-server-go/internal/services"
@@ -22,9 +23,88 @@ const (
 	formatMemo       = "- **[%d] %s** (%s) %s: %s\n"
 )
 
+type index_build_status struct {
+	Status      string `json:"status"`
+	Mode        string `json:"mode,omitempty"`
+	ProjectRoot string `json:"project_root"`
+	StartedAt   string `json:"started_at,omitempty"`
+	FinishedAt  string `json:"finished_at,omitempty"`
+	TotalFiles  int    `json:"total_files,omitempty"`
+	ElapsedMs   int64  `json:"elapsed_ms,omitempty"`
+	Error       string `json:"error,omitempty"`
+}
+
+func indexStatusFile(projectRoot string) string {
+	return filepath.Join(projectRoot, ".mcp-data", "index_status.json")
+}
+
+func writeIndexStatus(projectRoot string, st index_build_status) {
+	st.ProjectRoot = projectRoot
+	statusPath := indexStatusFile(projectRoot)
+	raw, err := json.MarshalIndent(st, "", "  ")
+	if err != nil {
+		return
+	}
+	tmpPath := statusPath + ".tmp"
+	if err := os.WriteFile(tmpPath, raw, 0644); err != nil {
+		return
+	}
+	_ = os.Rename(tmpPath, statusPath)
+}
+
+func startAsyncIndexBuild(projectRoot string, ai *services.ASTIndexer, forceFull bool) {
+	startedAt := time.Now()
+	mode := "auto"
+	if forceFull {
+		mode = "full"
+	}
+	writeIndexStatus(projectRoot, index_build_status{
+		Status:    "running",
+		Mode:      mode,
+		StartedAt: startedAt.Format(time.RFC3339),
+	})
+
+	go func(root string, started time.Time) {
+		var (
+			result *services.IndexResult
+			err    error
+		)
+		if forceFull {
+			result, err = ai.IndexFull(root)
+		} else {
+			result, err = ai.Index(root)
+		}
+		if err != nil {
+			writeIndexStatus(root, index_build_status{
+				Status:     "failed",
+				Mode:       mode,
+				StartedAt:  started.Format(time.RFC3339),
+				FinishedAt: time.Now().Format(time.RFC3339),
+				Error:      err.Error(),
+			})
+			return
+		}
+
+		if analysis, aErr := ai.AnalyzeNamingStyle(root); aErr == nil {
+			rulesPath := filepath.Join(root, "_MPM_PROJECT_RULES.md")
+			_ = generateProjectRules(rulesPath, analysis)
+		}
+
+		writeIndexStatus(root, index_build_status{
+			Status:     "success",
+			Mode:       mode,
+			StartedAt:  started.Format(time.RFC3339),
+			FinishedAt: time.Now().Format(time.RFC3339),
+			TotalFiles: result.TotalFiles,
+			ElapsedMs:  result.ElapsedMs,
+		})
+	}(projectRoot, startedAt)
+}
+
 // InitArgs 初始化参数
 type InitArgs struct {
-	ProjectRoot string `json:"project_root" jsonschema:"description=项目根路径 (绝对路径)"`
+	ProjectRoot    string `json:"project_root" jsonschema:"description=项目根路径 (绝对路径)"`
+	ForceFullIndex bool   `json:"force_full_index" jsonschema:"description=强制全量索引（禁用大仓库bootstrap策略，默认false）"`
 }
 
 // SessionManager 管理项目上下文（项目根路径与记忆层）
@@ -76,6 +156,11 @@ type SystemRecallArgs struct {
 	Limit    int    `json:"limit" jsonschema:"default=20,description=返回条数"`
 }
 
+// IndexStatusArgs 索引状态参数
+type IndexStatusArgs struct {
+	ProjectRoot string `json:"project_root" jsonschema:"description=可选项目根路径，留空时使用当前会话项目"`
+}
+
 // RegisterSystemTools 注册系统工具
 func RegisterSystemTools(s *server.MCPServer, sm *SessionManager, ai *services.ASTIndexer) {
 	s.AddTool(mcp.NewTool("initialize_project",
@@ -87,6 +172,8 @@ func RegisterSystemTools(s *server.MCPServer, sm *SessionManager, ai *services.A
 参数：
   project_root (必填)
     项目根目录的绝对路径。如果留空，工具会尝试自动探测。
+  force_full_index (可选)
+    强制全量索引（禁用大仓库 bootstrap 策略）。默认 false。
 
 说明：
   - 手动指定 project_root 时必须使用绝对路径。
@@ -140,6 +227,26 @@ func RegisterSystemTools(s *server.MCPServer, sm *SessionManager, ai *services.A
   "mpm 召回", "mpm 历史", "mpm recall"`),
 		mcp.WithInputSchema[SystemRecallArgs](),
 	), wrapSystemRecall(sm))
+
+	s.AddTool(mcp.NewTool("index_status",
+		mcp.WithDescription(`index_status - 查看 AST 索引后台任务状态
+
+用途：
+  查询 initialize_project 启动的后台索引任务进度、心跳和数据库文件大小。
+
+参数：
+  project_root (可选)
+    指定项目根路径。留空时使用当前会话项目。
+
+返回：
+  - status/mode/started_at/finished_at
+  - heartbeat(processed/total)
+  - symbols.db / symbols.db-wal / symbols.db-shm 文件大小
+
+触发词：
+  "mpm 索引状态", "mpm index status"`),
+		mcp.WithInputSchema[IndexStatusArgs](),
+	), wrapIndexStatus(sm))
 }
 
 func wrapInit(sm *SessionManager, ai *services.ASTIndexer) server.ToolHandlerFunc {
@@ -215,15 +322,7 @@ func wrapInit(sm *SessionManager, ai *services.ASTIndexer) server.ToolHandlerFun
 			sm.TaskChainsV2 = make(map[string]*TaskChainV2)
 		}
 
-		// 6. 🆕 【关键】刷新 AST 索引数据库
-		// 确保 symbols.db 是最新的，否则所有代码工具都会查询到旧数据
-		_, indexErr := ai.Index(absRoot)
-		indexStatus := "✅"
-		if indexErr != nil {
-			indexStatus = fmt.Sprintf("⚠️ (索引失败: %v)", indexErr)
-		}
-
-		// 7. 植入 visualize_history.py (Timeline 生成脚本)
+		// 6. 植入 visualize_history.py (Timeline 生成脚本)
 		// 写入到项目根目录，如果不存在或强制更新（这里简化为覆盖）
 		scriptPath := filepath.Join(absRoot, "visualize_history.py")
 		if err := os.WriteFile(scriptPath, []byte(VisualizeHistoryScript), 0644); err != nil {
@@ -231,16 +330,19 @@ func wrapInit(sm *SessionManager, ai *services.ASTIndexer) server.ToolHandlerFun
 			fmt.Printf("Warning: Failed to inject visualize_history.py: %v\n", err)
 		}
 
-		// 8. 规则生成 (_MPM_PROJECT_RULES.md)
-		var rulesMsg string
+		// 7. 立即写入一份规则模板，索引完成后会在后台自动刷新为真实统计
+		var rulesMsg = "\n\n[NEW] 已同步项目规则模板: _MPM_PROJECT_RULES.md\nIDE 将自动加载更新后的规则。"
 		rulesPath := filepath.Join(absRoot, "_MPM_PROJECT_RULES.md")
+		_ = generateProjectRules(rulesPath, &services.NamingAnalysis{IsNewProject: true})
 
-		analysis, err := ai.AnalyzeNamingStyle(absRoot)
-		if err == nil {
-			if err := generateProjectRules(rulesPath, analysis); err == nil {
-				rulesMsg = "\n\n[NEW] 已同步项目规则模板: _MPM_PROJECT_RULES.md\nIDE 将自动加载更新后的规则。"
-			}
+		// 8. 异步启动索引，避免大项目初始化阻塞/超时
+		startAsyncIndexBuild(absRoot, ai, args.ForceFullIndex)
+		statusPath := filepath.ToSlash(indexStatusFile(absRoot))
+		mode := "auto"
+		if args.ForceFullIndex {
+			mode = "full"
 		}
+		indexStatus := fmt.Sprintf("🚀 后台构建中（mode=%s, 状态文件: %s）", mode, statusPath)
 
 		return mcp.NewToolResultText(fmt.Sprintf("✅ 项目初始化成功！\n\n项目目录: %s\n数据库已准备就绪。\nAST 索引: %s%s", absRoot, indexStatus, rulesMsg)), nil
 	}
@@ -257,6 +359,7 @@ func generateProjectRules(path string, analysis *services.NamingAnalysis) error 
 4. **改代码后** → 必须立即 ` + "`memo`" + ` 记录
 5. **准备改函数时** → 必须先 ` + "`code_impact`" + ` 分析谁在调用它
 6. **code_search 失败** → 必须换词重试（同义词/缩写/驼峰变体），禁止放弃
+7. **阅读业务流程时** → 优先使用 ` + "`flow_trace`" + `，禁止只看文件名凭感觉推断
 
 ---
 
@@ -267,6 +370,7 @@ func generateProjectRules(path string, analysis *services.NamingAnalysis) error 
 | **任务复杂/模糊** | ` + "`manager_analyze`" + ` (必填 Intent) |
 | **任务 > 2 步** | ` + "`task_chain`" + ` (防止搞砸) |
 | 刚接手项目 / 宏观探索 | ` + "`project_map`" + ` |
+| 理解业务逻辑主链 | ` + "`flow_trace`" + ` |
 | 找具体函数/类的定义 | ` + "`code_search`" + ` |
 | 准备修改某函数 | ` + "`code_impact`" + ` |
 | 代码改完了 | ` + "`memo`" + ` (SSOT) |
@@ -354,6 +458,73 @@ func generateProjectRules(path string, analysis *services.NamingAnalysis) error 
 
 	content := mpmProtocol + "\n" + namingRules
 	return os.WriteFile(path, []byte(content), 0644)
+}
+
+func wrapIndexStatus(sm *SessionManager) server.ToolHandlerFunc {
+	return func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		_ = ctx
+
+		var args IndexStatusArgs
+		if err := request.BindArguments(&args); err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("参数错误: %v", err)), nil
+		}
+
+		root := strings.TrimSpace(args.ProjectRoot)
+		if root == "" {
+			root = sm.ProjectRoot
+		}
+		if root == "" {
+			return mcp.NewToolResultError("项目未初始化，请先执行 initialize_project 或传入 project_root"), nil
+		}
+
+		absRoot, err := filepath.Abs(root)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("路径解析失败: %v", err)), nil
+		}
+		absRoot = filepath.ToSlash(filepath.Clean(absRoot))
+
+		result := map[string]interface{}{
+			"project_root": absRoot,
+		}
+
+		statusPath := indexStatusFile(absRoot)
+		result["status_file"] = filepath.ToSlash(statusPath)
+		if raw, err := os.ReadFile(statusPath); err == nil {
+			var status map[string]interface{}
+			if err := json.Unmarshal(raw, &status); err == nil {
+				result["index_status"] = status
+			} else {
+				result["index_status_raw"] = string(raw)
+			}
+		} else {
+			result["index_status_error"] = err.Error()
+		}
+
+		heartbeatPath := filepath.Join(absRoot, ".mcp-data", "heartbeat")
+		result["heartbeat_file"] = filepath.ToSlash(heartbeatPath)
+		if raw, err := os.ReadFile(heartbeatPath); err == nil {
+			var heartbeat map[string]interface{}
+			if err := json.Unmarshal(raw, &heartbeat); err == nil {
+				result["heartbeat"] = heartbeat
+			} else {
+				result["heartbeat_raw"] = string(raw)
+			}
+		} else {
+			result["heartbeat_error"] = err.Error()
+		}
+
+		sizeMap := map[string]int64{}
+		for _, name := range []string{"symbols.db", "symbols.db-wal", "symbols.db-shm"} {
+			p := filepath.Join(absRoot, ".mcp-data", name)
+			if st, err := os.Stat(p); err == nil {
+				sizeMap[name] = st.Size()
+			}
+		}
+		result["db_file_sizes"] = sizeMap
+
+		rawOut, _ := json.MarshalIndent(result, "", "  ")
+		return mcp.NewToolResultText(string(rawOut)), nil
+	}
 }
 
 func wrapOpenTimeline(sm *SessionManager) server.ToolHandlerFunc {
