@@ -141,12 +141,43 @@ jobs:
             2. 解压到任意目录
             3. 在 MCP 客户端配置中指向 `mpm-go` 可执行文件
             
-            ### 更新内容
+            ### 新功能
             
-            - AST 精确调用链支持 (canonical_id, callee_id)
-            - 自适应任务链 V2 (决策点/动态插入/提前终止)
-            - system_recall 宽进严出策略
-            - persona Buff 机制
+            **task_chain 协议模式**
+            - 新增协议状态机：支持 execute/gate/loop 三种阶段类型
+            - 内置协议：develop / debug / refactor（大工程开发、问题排查、重构）
+            - Gate 门控：pass/fail 路由 + 最大重试次数
+            - Loop 循环：动态生成子任务列表，逐个执行
+            - SQLite 持久化 + 事件溯源，支持跨会话 resume
+            - 路由自动分流：传 phase_id 走协议模式，传 step_number 走线性模式
+            
+            **自审升级机制**
+            - 每阶段完成自动注入自审提示，引导 LLM 判断方向
+            - 三级升级：第 1 次 re-init 放行 → 第 2 次 re-init 工具硬拦，强制询问用户
+            - ReinitCount 持久化到 DB，跨会话有效
+            
+            **模板热加载**
+            - 支持 .mcp-config/task_chain_templates.{yaml,yml,json} 自定义模板
+            - 编辑保存后立即生效，无需重启 MCP
+            - 内置 develop/debug/refactor 模板
+            
+            ### 优化
+            
+            - manager_analyze：提升 anchors/facts/handoff 信噪比
+            - task_chain 线性模式：修复状态机与示例一致性、决策点轻量化、status 输出改为 JSON
+            - 索引优化：EnsureFreshIndex 5分钟窗口、分批事务提交、默认忽略第三方目录
+            - flow_trace：新增渐进披露模式（brief/standard/deep）、关键路径 Top3
+            
+            ### 文档
+            
+            - README/MANUAL 双语同步，新增"30秒上手"引导
+            - 明确线性/协议模式分流规则：step_number vs phase_id
+            - 统一术语，清理 V1/V2/V3 字眼
+            
+            ### 删除
+            
+            - prompt_enhance 工具（与 manager_analyze 职责重叠）
+            - triage 模板（与 manager_analyze 入口重叠）
           draft: false
           prerelease: false
           files: |
