@@ -1,0 +1,6 @@
+# Skills 目录不计入语言统计
+skills/* linguist-vendored
+mcp-server-go/skills/* linguist-vendored
+
+# Python 脚本视为第三方代码
+*.py linguist-vendored

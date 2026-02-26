@@ -1,0 +1,34 @@
+# Build
+bin/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# MPM Data (本地数据库，不提交)
+.mcp-data/
+
+# Rust
+target/
+Cargo.lock
+
+# Go
+vendor/
+
+# Node
+node_modules/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp
+*.tmp
+*.log
+*.bak
