@@ -189,7 +189,11 @@ LAYER_2_INDIRECT (11):
 
 **Triggers**: `mpm analyze`, `mpm mg`
 
-**Purpose**: Entry point for complex tasks, two-step self-iteration generates intelligence briefing.
+**When to use**: This tool is **optional**. Use it when any of the following applies:
+- Just took over a completely unfamiliar project with no code clues at all
+- Context is too noisy and scattered; the LLM needs to converge attention before proceeding
+
+**For single-point bug fixes or tasks with a clear target, skip this tool and go directly to `code_search`.**
 
 **Parameters**:
 | Parameter | Description | Required |
@@ -452,16 +456,15 @@ After initialization, apply `_MPM_PROJECT_RULES.md` to your client system rules 
 
 ```
 ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│    Plan     │ ──▶ │   Execute   │ ──▶ │   Record    │
-│ manager_    │     │ Code Change │     │    memo     │
-│ analyze     │     │             │     │             │
+│   Locate    │ ──▶ │   Execute   │ ──▶ │   Record    │
+│ code_search │     │ Code Change │     │    memo     │
+│ code_impact │     │             │     │             │
 └─────────────┘     └─────────────┘     └─────────────┘
        │                   ▲                   │
-       │           ┌───────┴───────┐           │
-       └──────────▶│  Perception   │◀──────────┘
-                   │ code_search   │
-                   │ code_impact   │
-                   └───────────────┘
+       └───────────────────┴───────────────────┘
+
+[Optional] When project has > 100 files and user mentions no symbols,
+call manager_analyze before the Locate step.
 ```
 
 ### 3.2 Golden Rules
@@ -511,7 +514,7 @@ After initialization, apply `_MPM_PROJECT_RULES.md` to your client system rules 
 | Tool calls | 10+ | 2 | **400%** |
 | First-step accuracy | 0% | 100% | **∞** |
 
-**Reason**: `manager_analyze` directly returns precise coordinates (file:line), no trial and error.
+**Reason**: `code_search` directly returns precise coordinates (file:line), no trial and error.
 
 ---
 

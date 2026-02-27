@@ -54,7 +54,6 @@ func main() {
 	tools.RegisterSkillTools(s, sm)            // 技能库工具
 	tools.RegisterTaskTools(s, sm)             // 任务管理工具
 	tools.RegisterEnhanceTools(s, sm)          // 增强工具 (persona)
-	tools.RegisterDocTools(s, sm, ai)          // 文档工具 (wiki_writer)
 
 	fmt.Fprintf(os.Stderr, "[MCP-Go] MyProjectManager 正在启动...\n")
 
