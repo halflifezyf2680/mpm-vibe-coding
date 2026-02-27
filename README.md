@@ -127,7 +127,7 @@ python package_product.py
 | `mpm 地图` | `project_map` | 项目结构 + 热力图 |
 | `mpm 流程` | `flow_trace` | 业务流程追踪（入口/上游/下游） |
 | `mpm 分析` | `manager_analyze` | 任务情报简报 |
-| `mpm 任务链` | `task_chain` | 顺序执行与断点 / 协议状态机（develop/debug/refactor） |
+| `mpm 任务链` | `task_chain` | 协议状态机驱动（linear/develop/debug/refactor），支持门控与子任务 |
 | `mpm 记录` | `memo` | 变更备忘录 |
 | `mpm 历史` | `system_recall` | 记忆召回 |
 | `mpm 人格` | `persona` | 切换 AI 人格 |

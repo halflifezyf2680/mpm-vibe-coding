@@ -214,143 +214,67 @@ Step 2: Generate Strategy
 
 ---
 
-#### task_chain Linear Mode - Adaptive Task Chain
+#### task_chain - Protocol State Machine
 
 **Triggers**: `mpm chain`, `mpm taskchain`
 
-**Purpose**: A near-complete **Agent framework**, each step is an independent checkpoint with dynamic plan adjustment.
+**Purpose**: Designed for large projects and long-running tasks. Uses predefined "protocols" to drive multi-phase workflows with built-in Gate checkpoints, Loop sub-tasks, and cross-session persistence.
 
-**Core Capabilities**:
+**Core Concepts**:
+1. **Protocol**: A predefined task template (e.g., `develop`, `debug`).
+2. **Phase**: Different lifecycle stages of a task, categorized as `execute`, `gate`, or `loop`.
+3. **Gate**: A mandatory self-review checkpoint controlled by `result=pass|fail`.
 
-| Mode | Description | Parameters |
-|------|-------------|------------|
-| `step` | Initialize + auto-start first step | `task_id`, `plan`, `description` |
-| `start` | Start specified step | `task_id`, `step_number` |
-| `complete` | Complete step + **mandatory summary** | `task_id`, `step_number`, `summary` |
-| `insert` | Insert step (decimal numbering 1.1, 1.2) | `task_id`, `after`, `insert_plan` |
-| `update` | Replace subsequent steps (replan) | `task_id`, `from`, `update_plan` |
-| `delete` | Delete steps (single or all remaining) | `task_id`, `step_to_delete` or `delete_scope="remaining"` |
-| `finish` | Early termination (goal achieved) | `task_id` |
+**Operation Modes**:
 
-**How to choose a mode (the key routing rule)**:
+| Mode | Required Parameters | Description |
+|------|--------------------|-------------|
+| `init` | `task_id`, `protocol` | Initialize the task chain. Default `protocol=linear` |
+| `start` | `task_id`, `phase_id` | Start a specific phase |
+| `complete` | `task_id`, `phase_id`, `summary` | Complete a phase. `gate` types require `result=pass\|fail` |
+| `spawn` | `task_id`, `phase_id`, `sub_tasks` | Dispatch sub-tasks in a `loop` phase |
+| `complete_sub` | `task_id`, `phase_id`, `sub_id`, `summary` | Complete a single sub-task |
+| `status` | `task_id` | View current progress wall (auto-identifies protocol) |
+| `resume` | `task_id` | Restore task across sessions (loads automatically from DB) |
+| `protocol` | - | List all available protocols and their phase definitions |
+| `finish` | `task_id` | Permanently close the task chain |
 
-| Goal | What to use | Key parameters |
-|------|-------------|----------------|
-| Drive work by a step list; insert/replace/delete subsequent steps | Linear mode (this section) | Advance with `step_number`; supports `insert/update/delete` |
-| Drive work by protocol phases (gate/loop/sub-tasks) | Protocol mode (next section) | Initialize with `mode=init` + `protocol=...`; advance with `phase_id`; gate completion requires `result=pass|fail` |
+**Built-in Protocol Flow Table**:
 
-**Quick rule**: for `mode="start"/"complete"`, if you pass `step_number` you are in linear mode; if you pass `phase_id` you are in protocol mode.
-
-**Not sure what you have**: run `task_chain(mode="status", task_id="...")` first and follow the next-step hint (`step_number` or `phase_id`).
-
-**Decision Point Mechanism**:
-
-After each step completes, the system returns a decision interface:
-
-```
-══════════════════════════════════════════════════════════════
-                【Step 1.0 Complete】Search Symbols
-══════════════════════════════════════════════════════════════
-
-**Summary**: Found 3 Login related functions...
-
----
-
-## 🤔 Decision Time
-
-1️⃣ **Continue Next** (Step 2.0)
-   task_chain(mode="start", task_id="MIGRATION", step_number=2.0)
-
-2️⃣ **Insert New Step** (after Step 1.0)
-   task_chain(mode="insert", task_id="MIGRATION", after=1.0, insert_plan=[...])
-
-3️⃣ **Delete Remaining** (goal already achieved)
-   task_chain(mode="delete", task_id="MIGRATION", delete_scope="remaining")
-```
-
-**Why Stronger Than Regular Todo**:
-- **State Machine Driven**: `todo → in_progress → complete`
-- **Mandatory Summary**: Each step must submit summary, knowledge accumulation
-- **Dynamic Planning**: Insert/delete/replace steps anytime
-- **Smart Termination**: End early when goal is achieved
-
----
-
-#### task_chain Protocol Mode - Protocol State Machine
-
-**Purpose**: Designed for large projects. Drives multi-phase tasks with predefined protocols, with built-in Gate checkpoints, Loop sub-tasks, and self-review escalation.
-
-**Three Phase Types**:
-
-| Type | Description |
-|------|-------------|
-| `execute` | Normal execution phase, proceeds to next phase on completion |
-| `gate` | Checkpoint with pass/fail routing, supports max retry count |
-| `loop` | Loop phase with dynamically spawned sub-task list |
-
-**Built-in Protocols**:
-
-| Protocol | Flow | Use Case |
-|----------|------|----------|
-| `linear` | main | Simple linear tasks |
+| Protocol | Flow (Phases) | Use Case |
+|----------|---------------|----------|
+| `linear` | main (execute) | Highly deterministic, single-step tasks |
 | `develop` | analyze → plan_gate → implement(loop) → verify_gate → finalize | Cross-module development |
 | `debug` | reproduce → locate → fix(loop) → verify_gate → finalize | Bug investigation |
 | `refactor` | baseline → analyze → refactor(loop) → verify_gate → finalize | Large-scale refactoring |
 
-**Protocol-Specific Modes**:
+**Self-Review & Escalation**:
 
-| Mode | Description | Parameters |
-|------|-------------|------------|
-| `init` | Initialize protocol chain | `task_id`, `protocol`, `description` (or `phases` for manual definition) |
-| `start` | Start a phase | `task_id`, `phase_id` |
-| `complete` | Complete a phase | `task_id`, `phase_id`, `summary` (gate requires `result=pass\|fail`) |
-| `spawn` | Spawn sub-tasks in loop phase | `task_id`, `phase_id`, `sub_tasks` |
-| `complete_sub` | Complete a sub-task | `task_id`, `phase_id`, `sub_id`, `summary`, `result` |
-| `resume` | Cross-session restore | `task_id` |
-| `status` | View current state | `task_id` |
-| `protocol` | List available protocols | - |
+Built-in Re-init interception prevents the LLM from spinning in circles on the same TaskID:
+- **1st time**: Re-init allowed (resets progress).
+- **2nd time**: Hard block, requiring the LLM to explain the deviation and request human intervention.
 
 **Typical Usage**:
+
 ```javascript
-// Initialize develop protocol
-task_chain(mode="init", task_id="PROJ_001", protocol="develop", description="Refactor core module")
+// 1. Initialize a refactoring task
+task_chain(mode="init", task_id="AUTH_REFACTOR", protocol="refactor", description="Refactor auth module")
 
-// Complete analyze phase
-task_chain(mode="complete", task_id="PROJ_001", phase_id="analyze", summary="Broken into 3 sub-tasks")
+// 2. Complete baseline check
+task_chain(mode="complete", task_id="AUTH_REFACTOR", phase_id="baseline", summary="Current tests pass")
 
-// Gate pass
-task_chain(mode="complete", task_id="PROJ_001", phase_id="plan_gate", result="pass", summary="Plan is sufficient")
-
-// Spawn sub-tasks in loop phase
-task_chain(mode="spawn", task_id="PROJ_001", phase_id="implement", sub_tasks=[
-  {"name": "Refactor SessionManager", "verify": "go test ./core/..."},
-  {"name": "Refactor MemoryLayer"}
+// 3. Enter refactor loop
+task_chain(mode="spawn", task_id="AUTH_REFACTOR", phase_id="refactor", sub_tasks=[
+  {"name": "Decouple SessionStore"},
+  {"name": "Rewrite JWT signing"}
 ])
 
-// Complete sub-task
-task_chain(mode="complete_sub", task_id="PROJ_001", phase_id="implement", sub_id="sub_001", result="pass", summary="Done")
+// 4. Complete a sub-task
+task_chain(mode="complete_sub", task_id="AUTH_REFACTOR", phase_id="refactor", sub_id="sub_001", summary="Store extracted to interface")
 ```
 
-**Self-Review Mechanism**:
-
-After each phase completes, the tool automatically outputs a self-review prompt to guide the LLM:
-
-```
-🔍 Self-review: Is the current finding consistent with the initial goal?
-  • All good → continue to next phase
-  • Major deviation found, enough info → re-init (overwrite current chain)
-  • Major deviation found, not enough info → gather more info first, then decide
-```
-
-**Three-Level Escalation** (enforced by tool, not just prompt):
-
-| Count | Behavior |
-|-------|----------|
-| 0 | Normal execution |
-| 1st re-init | Tool allows, resets chain |
-| 2nd re-init | Tool hard-blocks, forces stop and asks user |
-
-`ReinitCount` is persisted to DB — escalation logic survives cross-session restores.
+**Why was Linear Step Mode deprecated in V3?**
+The V3 `linear` protocol, combined with `loop` phases, perfectly replaces the dynamic step capabilities of the old mode while providing robust DB persistence and multi-level self-review, no longer relying on volatile memory state.
 
 ---
 

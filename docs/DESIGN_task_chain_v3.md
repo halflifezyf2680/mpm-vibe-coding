@@ -259,12 +259,19 @@ CREATE TABLE task_chain_events (
 - 事后复盘任务执行过程
 - 与 memo/timeline 联动
 
-## 7. 向后兼容
+## 7. 向后兼容性说明 (已于 2026-02 变更)
 
-- V2 的 `mode=step/start/complete/insert/update/delete/finish` 继续工作
-- V2 任务自动视为只有 execute 类型 phase 的线性协议
-- 新增 `mode=init`（协议初始化）、`mode=spawn`（子任务生成）、`mode=complete_sub`（子任务完成）、`mode=resume`（跨会话恢复）
-- `mode=template` 改为 `mode=protocol` 列出可用协议
+**重大变更**：在 2026-02 的版本中，我们正式移除了旧版的 `mode=step/insert/update/delete` 等基于内存的线性模式。
+
+**原因**：
+- **一致性**：V3 的 `linear` 协议可以覆盖旧版所有场景。
+- **稳定性**：旧版内存模式在 Server 重启后数据即丢，不符合 Vibe Coding 长期任务的要求。
+- **代码精简**：移除旧版逻辑后，MCP Server 代码体积减少约 500+ 行，显著降低维护成本。
+
+**现状**：
+- `task_chain` 现在强制使用协议状态机模式。
+- 若需“线性步骤”，请使用 `init` 模式并选择 `protocol="linear"` (默认值)。
+- 旧版的 `mode=step` 调用将返回错误，引导用户转向 `init` 模式。
 
 ## 8. 内置协议
 

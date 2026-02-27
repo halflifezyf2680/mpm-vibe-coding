@@ -107,22 +107,11 @@ type InitArgs struct {
 	ForceFullIndex bool   `json:"force_full_index" jsonschema:"description=强制全量索引（禁用大仓库bootstrap策略，默认false）"`
 }
 
-// SessionManager 管理项目上下文（项目根路径与记忆层）
 type SessionManager struct {
 	Memory        *core.MemoryLayer
 	ProjectRoot   string
-	TaskChains    map[string]*TaskChain     // 线性任务链（基础版）
-	TaskChainsV2  map[string]*TaskChainV2   // 线性任务链（自适应版）
 	TaskChainsV3  map[string]*TaskChainV3   // 协议状态机任务链
 	AnalysisState map[string]*AnalysisState // manager_analyze 两步调用的中间状态
-}
-
-// TaskChain 任务链状态（基础版，向后兼容）
-type TaskChain struct {
-	TaskID      string   `json:"task_id"`
-	Plan        []string `json:"plan"`
-	CurrentStep int      `json:"current_step"`
-	Status      string   `json:"status"` // running, paused, finished
 }
 
 // AnalysisState 第一步分析结果（临时存储）
@@ -316,12 +305,6 @@ func wrapInit(sm *SessionManager, ai *services.ASTIndexer) server.ToolHandlerFun
 
 		sm.Memory = mem
 		sm.ProjectRoot = absRoot
-		if sm.TaskChains == nil {
-			sm.TaskChains = make(map[string]*TaskChain)
-		}
-		if sm.TaskChainsV2 == nil {
-			sm.TaskChainsV2 = make(map[string]*TaskChainV2)
-		}
 
 		// 6. 植入 visualize_history.py (Timeline 生成脚本)
 		// 写入到项目根目录，如果不存在或强制更新（这里简化为覆盖）

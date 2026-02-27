@@ -127,7 +127,7 @@ Notes:
 | `mpm map` | `project_map` | Project structure + heat map |
 | `mpm flow` | `flow_trace` | Business flow trace (entry/upstream/downstream) |
 | `mpm analyze` | `manager_analyze` | Task intelligence briefing |
-| `mpm chain` | `task_chain` | Sequential execution with checkpoints / Protocol state machine (develop/debug/refactor) |
+| `mpm chain` | `task_chain` | Protocol state machine driven (linear/develop/debug/refactor), supporting gates & sub-tasks |
 | `mpm memo` | `memo` | Change documentation |
 | `mpm recall` | `system_recall` | Memory retrieval |
 | `mpm persona` | `persona` | Switch AI personality |
