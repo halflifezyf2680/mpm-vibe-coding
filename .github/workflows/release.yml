@@ -78,6 +78,7 @@ jobs:
           cp QUICKSTART_EN.md release/mpm-${{ matrix.os }}-${{ matrix.arch }}/
           cp mcp-config-example.json release/mpm-${{ matrix.os }}-${{ matrix.arch }}/
           cp -r docs release/mpm-${{ matrix.os }}-${{ matrix.arch }}/
+          cp -r mcp-server-go/configs release/mpm-${{ matrix.os }}-${{ matrix.arch }}/
           
           if [ "${{ matrix.os }}" = "windows" ]; then
             cd release && 7z a mpm-${{ matrix.os }}-${{ matrix.arch }}.zip mpm-${{ matrix.os }}-${{ matrix.arch }}
@@ -141,14 +142,15 @@ jobs:
             2. 解压到任意目录
             3. 在 MCP 客户端配置中指向 `mpm-go` 可执行文件
             
-            ### 优化
+            ### 修复
             
-            - manager_analyze 规则降级：从强制执行改为可选，明确适用场景（接手陌生项目 / 上下文过多需收敛注意力）
-            - task_chain 触发条件修正：明确为多模块/多阶段修改、预计需要多轮对话才使用
+            - 修复 persona 工具的加载 bug：解决了打包时配置文件丢失、导致角色设定退化的问题。
+            - 修复多语言环境兼容性：增加自动识别与隐式透传机制，防止长篇设定指令无法传递给底层大语言模型的问题。
             
-            ### 删除
+            ### 删减与优化
             
-            - wiki_writer 工具（本质为 prompt 模板封装，不提供真实能力扩展，废除）
+            - 取消 manager_analyze 强制规则。
+            - 废除 wiki_writer 伪能力工具。
           draft: false
           prerelease: false
           files: |
