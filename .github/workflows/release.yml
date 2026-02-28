@@ -78,6 +78,7 @@ jobs:
           cp QUICKSTART_EN.md release/mpm-${{ matrix.os }}-${{ matrix.arch }}/
           cp mcp-config-example.json release/mpm-${{ matrix.os }}-${{ matrix.arch }}/
           cp -r docs release/mpm-${{ matrix.os }}-${{ matrix.arch }}/
+          rm -f release/mpm-${{ matrix.os }}-${{ matrix.arch }}/docs/DESIGN_task_chain_v3.md
           cp -r mcp-server-go/configs release/mpm-${{ matrix.os }}-${{ matrix.arch }}/
           
           if [ "${{ matrix.os }}" = "windows" ]; then
@@ -142,16 +143,9 @@ jobs:
             2. 解压到任意目录
             3. 在 MCP 客户端配置中指向 `mpm-go` 可执行文件
             
-            ### 🐛 重要修复 (Task Chain)
+            ### 🐛 重要修复
             
-            - **底层数据流解包容错**：修复 `sub_tasks` 在部分大模型客户端由于转义导致解析崩溃（[]map[string]interface{} 强依赖）的问题，增加 `convertToMapSlice` 字符串剥离反序列化能力。
-            - **状态机闭环**：完善 V3 协议状态机，拦截 Active 状态非正规打卡动作，彻底巩固任务流程约束力。
-            
-            ### 🚀 架构升级 (Two-Hats Architecture)
-            
-            - **长短周期职责剥离**：引入极简的 [@mpm_architect](opencode-agents/mpm_architect.md) 负责纯函数分发与敏捷开发。
-            - **史诗大管家**：明确 [@mpm_pm](opencode-agents/mpm_pm.md) 独占使用 task_chain 控制长线大工程流转，解决大型复杂需求引发的上下文爆炸痛点。
-            - 强化了 Context 数据与持久化 State Machine 控制流的绝对物理隔离（状态机存指针打卡，Markdown存厚重字典）。
+            - 修复 task_chain 信息截断处理与渲染的一个小问题。
           draft: false
           prerelease: false
           files: |
