@@ -1,0 +1,40 @@
+{
+  "serverInfo": {
+    "name": "mpm-coding",
+    "version": "1.13.1"
+  },
+  "tools": [
+    {
+      "name": "mpm_analyze",
+      "description": "Analyze complex codebase logic."
+    },
+    {
+      "name": "flow_trace",
+      "description": "Trace business flow."
+    },
+    {
+      "name": "project_map",
+      "description": "View macro project map."
+    },
+    {
+      "name": "code_search",
+      "description": "Search function definitions and classes."
+    },
+    {
+      "name": "code_impact",
+      "description": "Analyze code modification impact."
+    },
+    {
+      "name": "persona",
+      "description": "Switch AI persona."
+    },
+    {
+      "name": "task_chain",
+      "description": "Manage multi-step multi-module workflows."
+    },
+    {
+      "name": "memo",
+      "description": "Record design and memory."
+    }
+  ]
+}
