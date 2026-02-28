@@ -40,8 +40,8 @@ type TaskChainArgs struct {
 	Result      string                   `json:"result" jsonschema:"description=gate结果 pass/fail (complete gate模式) 或子任务结果 (complete_sub模式)"`
 	Summary     string                   `json:"summary" jsonschema:"description=步骤/阶段/子任务总结 (complete/complete_sub模式)"`
 	SubID       string                   `json:"sub_id" jsonschema:"description=子任务ID (complete_sub模式)"`
-	SubTasks    []map[string]interface{} `json:"sub_tasks" jsonschema:"description=子任务列表 (spawn模式)"`
-	Phases      []map[string]interface{} `json:"phases" jsonschema:"description=手动定义阶段列表 (init模式)"`
+	SubTasks    interface{}              `json:"sub_tasks" jsonschema:"description=子任务列表 (spawn模式)"`
+	Phases      interface{}              `json:"phases" jsonschema:"description=手动定义阶段列表 (init模式)"`
 }
 
 // RegisterTaskTools 注册任务管理工具

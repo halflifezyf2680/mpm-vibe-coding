@@ -13,6 +13,32 @@ import (
 
 // ========== 协议状态机 API Handler ==========
 
+func convertToMapSlice(v interface{}) ([]map[string]interface{}, error) {
+	if v == nil {
+		return nil, nil
+	}
+	switch val := v.(type) {
+	case string:
+		var result []map[string]interface{}
+		if err := json.Unmarshal([]byte(val), &result); err != nil {
+			return nil, err
+		}
+		return result, nil
+	case []interface{}:
+		var result []map[string]interface{}
+		for _, item := range val {
+			if m, ok := item.(map[string]interface{}); ok {
+				result = append(result, m)
+			}
+		}
+		return result, nil
+	case []map[string]interface{}:
+		return val, nil
+	default:
+		return nil, fmt.Errorf("未经支持的参数格式: %T", v)
+	}
+}
+
 // ensureV3Map 确保 TaskChainsV3 map 已初始化
 func ensureV3Map(sm *SessionManager) {
 	if sm.TaskChainsV3 == nil {
@@ -189,9 +215,13 @@ func initTaskChainV3(ctx context.Context, sm *SessionManager, args TaskChainArgs
 	var err error
 	protocol := strings.TrimSpace(args.Protocol)
 
-	if len(args.Phases) > 0 {
+	if args.Phases != nil {
+		phaseMaps, convErr := convertToMapSlice(args.Phases)
+		if convErr != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("处理 phases 参数失败: %v", convErr)), nil
+		}
 		// 手动定义 phases
-		phases, err = parsePhasesFromArgs(args.Phases)
+		phases, err = parsePhasesFromArgs(phaseMaps)
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("解析 phases 失败: %v", err)), nil
 		}
@@ -394,7 +424,7 @@ func spawnSubTasksV3(ctx context.Context, sm *SessionManager, args TaskChainArgs
 	if args.PhaseID == "" {
 		return mcp.NewToolResultError("spawn 模式需要 phase_id 参数"), nil
 	}
-	if len(args.SubTasks) == 0 {
+	if args.SubTasks == nil {
 		return mcp.NewToolResultError("spawn 模式需要 sub_tasks 参数"), nil
 	}
 
@@ -403,7 +433,12 @@ func spawnSubTasksV3(ctx context.Context, sm *SessionManager, args TaskChainArgs
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 
-	subs, err := parseSubTasksFromArgs(args.SubTasks)
+	subMaps, convErr := convertToMapSlice(args.SubTasks)
+	if convErr != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("处理 sub_tasks 参数失败: %v", convErr)), nil
+	}
+
+	subs, err := parseSubTasksFromArgs(subMaps)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("解析 sub_tasks 失败: %v", err)), nil
 	}
