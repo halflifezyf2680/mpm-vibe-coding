@@ -142,15 +142,16 @@ jobs:
             2. 解压到任意目录
             3. 在 MCP 客户端配置中指向 `mpm-go` 可执行文件
             
-            ### 修复
+            ### 🐛 重要修复 (Task Chain)
             
-            - 修复 persona 工具的加载 bug：解决了打包时配置文件丢失、导致角色设定退化的问题。
-            - 修复多语言环境兼容性：增加自动识别与隐式透传机制，防止长篇设定指令无法传递给底层大语言模型的问题。
+            - **底层数据流解包容错**：修复 `sub_tasks` 在部分大模型客户端由于转义导致解析崩溃（[]map[string]interface{} 强依赖）的问题，增加 `convertToMapSlice` 字符串剥离反序列化能力。
+            - **状态机闭环**：完善 V3 协议状态机，拦截 Active 状态非正规打卡动作，彻底巩固任务流程约束力。
             
-            ### 删减与优化
+            ### 🚀 架构升级 (Two-Hats Architecture)
             
-            - 取消 manager_analyze 强制规则。
-            - 废除 wiki_writer 伪能力工具。
+            - **长短周期职责剥离**：引入极简的 [@mpm_architect](opencode-agents/mpm_architect.md) 负责纯函数分发与敏捷开发。
+            - **史诗大管家**：明确 [@mpm_pm](opencode-agents/mpm_pm.md) 独占使用 task_chain 控制长线大工程流转，解决大型复杂需求引发的上下文爆炸痛点。
+            - 强化了 Context 数据与持久化 State Machine 控制流的绝对物理隔离（状态机存指针打卡，Markdown存厚重字典）。
           draft: false
           prerelease: false
           files: |

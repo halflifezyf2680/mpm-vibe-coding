@@ -628,15 +628,22 @@ func renderV3NextPhaseHint(chain *TaskChainV3, taskID, nextID string) string {
 }
 
 func renderV3StatusJSON(chain *TaskChainV3) string {
+	type subTaskView struct {
+		ID      string `json:"id"`
+		Name    string `json:"name"`
+		Status  string `json:"status"`
+		Summary string `json:"summary,omitempty"`
+	}
 	type phaseView struct {
-		ID         string `json:"id"`
-		Name       string `json:"name"`
-		Type       string `json:"type"`
-		Status     string `json:"status"`
-		Summary    string `json:"summary,omitempty"`
-		RetryCount int    `json:"retry_count,omitempty"`
-		SubTotal   int    `json:"sub_total,omitempty"`
-		SubDone    int    `json:"sub_done,omitempty"`
+		ID         string        `json:"id"`
+		Name       string        `json:"name"`
+		Type       string        `json:"type"`
+		Status     string        `json:"status"`
+		Summary    string        `json:"summary,omitempty"`
+		RetryCount int           `json:"retry_count,omitempty"`
+		SubTotal   int           `json:"sub_total,omitempty"`
+		SubDone    int           `json:"sub_done,omitempty"`
+		SubTasks   []subTaskView `json:"sub_tasks,omitempty"`
 	}
 	type statusView struct {
 		TaskID       string      `json:"task_id"`
@@ -663,18 +670,29 @@ func renderV3StatusJSON(chain *TaskChainV3) string {
 			Status: string(p.Status),
 		}
 		if p.Summary != "" {
-			pv.Summary = truncateRunes(p.Summary, 80)
+			pv.Summary = p.Summary
 		}
 		if p.Type == PhaseGate && p.RetryCount > 0 {
 			pv.RetryCount = p.RetryCount
 		}
 		if p.Type == PhaseLoop && len(p.SubTasks) > 0 {
 			pv.SubTotal = len(p.SubTasks)
+			var stViews []subTaskView
 			for _, s := range p.SubTasks {
 				if s.Status == SubTaskPassed || s.Status == SubTaskFailed {
 					pv.SubDone++
 				}
+				stv := subTaskView{
+					ID:     s.ID,
+					Name:   s.Name,
+					Status: string(s.Status),
+				}
+				if s.Summary != "" {
+					stv.Summary = s.Summary
+				}
+				stViews = append(stViews, stv)
 			}
+			pv.SubTasks = stViews
 		}
 		sv.Phases = append(sv.Phases, pv)
 	}

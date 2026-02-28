@@ -1,363 +1,94 @@
-# task_chain V3 设计文档：从线性执行器到协议状态机
-
-## 1. 问题
-
-当前 task_chain V2 是线性步骤队列：
-
-```
-Step1 → Step2 → Step3 → ... → Finish
-```
-
-- 不支持条件分支（验证失败后无法自动回退）
-- 不支持循环（多个子任务无法批量处理）
-- 不支持门控（阶段之间没有质量检查点）
-- 内存存储，断连即丢（大工程跨会话无法恢复）
-- "自适应"完全依赖 LLM 手动调 insert/update，引擎不参与决策
-
-这意味着 task_chain 无法驱动真正的大工程（跨多文件、多模块、需要中间验证和回退的任务）。
-
-## 2. 目标
-
-将 task_chain 升级为**协议状态机**：
-
-```
-Phase(分析) → Gate(充分?) 
-  ├─ pass  → Phase(执行, loop) → Gate(验证?)
-  │                                 ├─ pass → 下一个子任务 / 集成
-  │                                 └─ fail → 回退修复
-  └─ fail  → 回到 Phase(分析)
-```
-
-核心约束：**执行者是 LLM，不是程序**。引擎负责状态管理和流转决策，LLM 负责每个阶段内的具体执行。
-
-## 3. 核心概念
-
-### 3.1 Phase（阶段）
-
-替代 V2 的 Step，是状态机的基本节点。
-
-```go
-type PhaseType string
-
-const (
-    PhaseExecute PhaseType = "execute"  // 普通执行阶段
-    PhaseGate    PhaseType = "gate"     // 门控检查点
-    PhaseLoop    PhaseType = "loop"     // 循环阶段（内含子任务）
-)
-
-type Phase struct {
-    ID          string      `json:"id"`           // 阶段唯一标识（如 "analyze", "implement"）
-    Name        string      `json:"name"`         // 显示名称
-    Type        PhaseType   `json:"type"`         // 阶段类型
-    Status      PhaseStatus `json:"status"`       // pending / active / passed / failed / skipped
-    Input       string      `json:"input"`        // 建议的工具调用
-    Summary     string      `json:"summary"`      // 完成后的总结
-    
-    // Gate 专用
-    OnPass      string      `json:"on_pass"`      // 通过时跳转的 phase ID
-    OnFail      string      `json:"on_fail"`      // 失败时跳转的 phase ID
-    MaxRetries  int         `json:"max_retries"`  // 最大重试次数（防死循环），默认 3
-    RetryCount  int         `json:"retry_count"`  // 当前重试次数
-    
-    // Loop 专用
-    SubTasks    []SubTask   `json:"sub_tasks"`    // 动态子任务列表
-}
-```
-
-### 3.2 Gate（门控）
-
-门控是特殊的 Phase，LLM 在此提交评估结果（pass/fail），引擎根据结果决定下一个阶段。
-
-```
-LLM 调用: complete(phase_id="verify", result="fail", summary="测试失败: 3个用例未通过")
-引擎响应: "验证未通过，回退到 phase 'fix'（第 2/3 次重试）"
-```
-
-门控解决的问题：
-- 强制 LLM 在关键节点做质量判断
-- 引擎自动处理回退逻辑，LLM 不需要记住"失败了该回到哪"
-- max_retries 防止死循环
-
-### 3.3 Loop（循环阶段）
-
-Loop 阶段内包含动态子任务列表，所有子任务完成后才进入下一阶段。
-
-```
-LLM 调用: spawn(phase_id="implement", sub_tasks=[
-    {name: "重构 SessionManager", verify: "go test ./internal/core/..."},
-    {name: "重构 MemoryLayer", verify: "go test ./internal/core/..."},
-    {name: "更新 API 层", verify: "go test ./internal/tools/..."}
-])
-引擎响应: "已创建 3 个子任务，开始第 1 个: 重构 SessionManager"
-```
-
-子任务结构：
-```go
-type SubTask struct {
-    ID       string        `json:"id"`
-    Name     string        `json:"name"`
-    Verify   string        `json:"verify"`   // 验证命令/标准
-    Status   SubTaskStatus `json:"status"`   // pending / active / passed / failed
-    Summary  string        `json:"summary"`
-}
-```
-
-### 3.4 Protocol（协议）
-
-协议 = Phase 列表 + 连接关系。替代 V2 的模板。
-
-```yaml
-protocols:
-  - name: large_develop
-    description: "大工程开发协议"
-    phases:
-      - id: analyze
-        name: "需求分析与拆解"
-        type: execute
-        
-      - id: plan_gate
-        name: "拆解是否充分？"
-        type: gate
-        on_pass: implement
-        on_fail: analyze
-        max_retries: 2
-        
-      - id: implement
-        name: "逐个实现子任务"
-        type: loop
-        
-      - id: verify_gate
-        name: "集成验证"
-        type: gate
-        on_pass: finalize
-        on_fail: implement
-        max_retries: 3
-        
-      - id: finalize
-        name: "收尾归档"
-        type: execute
-```
-
-## 4. 状态流转
-
-```
-                    ┌──────────┐
-                    │ analyze  │ (execute)
-                    └────┬─────┘
-                         │ complete
-                    ┌────▼─────┐
-                ┌───│plan_gate │ (gate)
-                │   └────┬─────┘
-           fail │        │ pass
-           (retry)       │
-                │   ┌────▼─────┐
-                └──►│implement │ (loop)
-                    │ [子任务1] │──► 逐个执行
-                    │ [子任务2] │
-                    │ [子任务3] │
-                    └────┬─────┘
-                         │ 全部完成
-                    ┌────▼──────┐
-                ┌───│verify_gate│ (gate)
-                │   └────┬──────┘
-           fail │        │ pass
-           (retry)       │
-                │   ┌────▼─────┐
-                └──►│ finalize │ (execute)
-                    └──────────┘
-```
-
-## 5. API 设计
-
-### 5.1 初始化
-
-```
-task_chain(mode="init", task_id="PROJ_001", description="...", protocol="large_develop")
-// 或手动定义 phases
-task_chain(mode="init", task_id="PROJ_001", description="...", phases=[...])
-```
-
-### 5.2 执行阶段
-
-```
-task_chain(mode="start", task_id="PROJ_001", phase_id="analyze")
-```
-
-### 5.3 完成阶段
-
-```
-// execute 类型
-task_chain(mode="complete", task_id="PROJ_001", phase_id="analyze", summary="...")
-
-// gate 类型（必须传 result）
-task_chain(mode="complete", task_id="PROJ_001", phase_id="plan_gate", result="pass", summary="...")
-```
-
-### 5.4 生成子任务（loop 阶段）
-
-```
-task_chain(mode="spawn", task_id="PROJ_001", phase_id="implement", sub_tasks=[
-    {name: "重构 SessionManager", verify: "go test ./internal/core/..."},
-    {name: "重构 MemoryLayer", verify: "go test ./internal/core/..."}
-])
-```
-
-### 5.5 完成子任务
-
-```
-task_chain(mode="complete_sub", task_id="PROJ_001", phase_id="implement", sub_id="sub_001", result="pass", summary="...")
-```
-
-### 5.6 查看状态
-
-```
-task_chain(mode="status", task_id="PROJ_001")
-// 返回 JSON：当前 phase、各 phase 状态、子任务进度、重试计数
-```
-
-### 5.7 恢复任务（跨会话）
-
-```
-task_chain(mode="resume", task_id="PROJ_001")
-// 从持久化存储加载，返回当前状态和下一步建议
-```
-
-## 6. 持久化
-
-### 6.1 存储位置
-
-使用项目级 SQLite 数据库（与 memo/facts 共用 `symbols.db`）。
-
-### 6.2 表结构
-
-```sql
-CREATE TABLE task_chains (
-    task_id     TEXT PRIMARY KEY,
-    description TEXT,
-    protocol    TEXT,          -- 协议名称
-    status      TEXT,          -- running / paused / finished / failed
-    phases_json TEXT,          -- 完整 phases JSON
-    created_at  DATETIME,
-    updated_at  DATETIME
-);
-
-CREATE TABLE task_chain_events (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    task_id     TEXT,
-    phase_id    TEXT,
-    event_type  TEXT,          -- start / complete / fail / retry / spawn
-    payload     TEXT,          -- JSON: summary, result, sub_tasks 等
-    created_at  DATETIME,
-    FOREIGN KEY (task_id) REFERENCES task_chains(task_id)
-);
-```
-
-### 6.3 事件溯源
-
-`task_chain_events` 记录每一次状态变更，支持：
-- 跨会话恢复时重建上下文
-- 事后复盘任务执行过程
-- 与 memo/timeline 联动
-
-## 7. 向后兼容性说明 (已于 2026-02 变更)
-
-**重大变更**：在 2026-02 的版本中，我们正式移除了旧版的 `mode=step/insert/update/delete` 等基于内存的线性模式。
-
-**原因**：
-- **一致性**：V3 的 `linear` 协议可以覆盖旧版所有场景。
-- **稳定性**：旧版内存模式在 Server 重启后数据即丢，不符合 Vibe Coding 长期任务的要求。
-- **代码精简**：移除旧版逻辑后，MCP Server 代码体积减少约 500+ 行，显著降低维护成本。
-
-**现状**：
-- `task_chain` 现在强制使用协议状态机模式。
-- 若需“线性步骤”，请使用 `init` 模式并选择 `protocol="linear"` (默认值)。
-- 旧版的 `mode=step` 调用将返回错误，引导用户转向 `init` 模式。
-
-## 8. 内置协议
-
-### 8.1 linear（默认，兼容 V2）
-
-纯线性执行，无门控无循环。等价于当前 V2 行为。
-
-### 8.2 develop
-
-```
-analyze → plan_gate → implement(loop) → verify_gate → finalize
-```
-
-### 8.3 debug
-
-```
-reproduce → locate → fix(loop) → verify_gate → finalize
-```
-
-### 8.4 refactor
-
-```
-baseline → analyze → refactor(loop) → verify_gate → finalize
-```
-
-## 9. 实施计划
-
-1. **Phase 1: 数据层**
-   - 新增 DB 表（task_chains, task_chain_events）
-   - 实现持久化读写
-
-2. **Phase 2: 状态机引擎**
-   - Phase/Gate/Loop 状态流转逻辑
-   - 门控的 pass/fail 路由
-   - Loop 的子任务管理
-   - max_retries 防死循环
-
-3. **Phase 3: API 层**
-   - 新增 init/spawn/complete_sub/resume 模式
-   - 改造 complete 支持 gate result
-   - status 输出完整状态机视图
-
-4. **Phase 4: 协议与兼容**
-   - 内置协议定义（YAML 热加载）
-   - V2 向后兼容层
-   - 协议自定义支持
-
-5. **Phase 5: 验证**
-   - 单元测试
-   - 端到端测试（用真实任务跑一遍协议）
-   - 跨会话恢复测试
-
-## 10. 风险
-
-| 风险 | 影响 | 缓解 |
-|------|------|------|
-| LLM 在 gate 阶段给出错误的 pass/fail 判断 | 流程走偏 | gate 提示里明确评估标准；max_retries 兜底 |
-| 死循环（gate 反复 fail） | 任务卡死 | max_retries 强制终止，提示 LLM 换策略 |
-| 持久化数据损坏 | 任务无法恢复 | 事件溯源可重建；定期备份 |
-| V2 兼容性破坏 | 现有用法失效 | V2 API 保持不变，内部映射到 linear 协议 |
-
-## 11. 协议选择策略
-
-### 11.1 不做自动推荐
-
-`manager_analyze` 的复杂度评估基于 AST 静态分析，衡量的是代码结构复杂度，不是任务复杂度。一个改 3 行的 bug 可能需要跨 5 个模块验证（任务复杂度 High），但 AST 复杂度是 Low。因此不用 `manager_analyze` 自动推荐协议。
-
-### 11.2 默认 linear，显式升级
-
-- 不传 `protocol` 参数时，默认使用 `linear`（纯线性，等价于 V2）
-- 用户或 LLM 认为需要门控/循环时，显式指定协议
-- 工具描述里给出选择标准，LLM 自行判断
-
-### 11.3 工具描述中的选择标准
-
-```
-协议选择：
-- 不传 protocol（默认 linear）：任务步骤明确，线性推进即可
-- protocol="develop"：跨模块开发，需要拆解子任务并逐个验证
-- protocol="debug"：问题复现→定位→修复→验证，可能需要多轮重试
-- protocol="refactor"：大范围重构，需要基线验证和逐步替换
-```
-
-### 11.4 用户显式触发
-
-用户可以直接说：
-- "用 develop 协议"→ LLM 传 `protocol="develop"`
-- "这个任务比较大"→ LLM 判断后选择合适协议
-- 什么都不说 → 默认 linear
+# MPM `task_chain` 工具引擎说明 (V3 纯净版)
+
+`task_chain` 是 MPM 提供的一个基于本机的 SQLite 数据库所构建的 **状态机（State Machine）**。
+
+它的**唯一作用**是：提供一条强制约束任务流程执行先后顺序的轨道，记录多步拆解任务的流转进度。
+它**绝对不会**自动创建任何本机的目录或文件，也**绝对不会**自动帮你执行任何代码和命令。它纯粹是一个基于数据库交互的“考勤打卡系统”。
+
+## 1. 核心运行机制
+
+`task_chain` 的所有状态数据保存于本机的 SQLite 数据库（`symbols.db`）中。大模型通过给工具的 `mode` 参数传入不同动作，来改变数据库里的流转状态。
+
+### 1.1 阶段考勤点类型 (Phase Type)
+一条完整的任务链（Task Chain）由多个打卡节点（Phase）组成。节点类型严格分为以下 3 种：
+- **`execute` (普通执行节点)**：执行完你负责的动作后，调用 `complete` 打卡通过即可前往下一关。
+- **`gate` (质量门控节点)**：这是一种审查/防守节点。打卡调用 `complete` 时**必须显式附带** `result="pass"` 或 `result="fail"`。如果是 `pass` 放行去下一个阶段；如果是 `fail`，系统会强制让你退回上一阶段重干（会有最大重试次数限制兜底）。
+- **`loop` (循环节点)**：专门用来拆分并行工作的。进入这个节点后，不能直接完成，必须先用 `spawn` 下发具体的微型子任务（SubTasks）。随后通过 `complete_sub` 把子任务一个一个歼灭。当所有微型子任务被消灭干净，系统才会判定该节点达标放行。
+
+### 1.2 内置固定流水线 (Protocol)
+如果你在初始化 (`init`) 阶段不手搓路线，可以直接调用系统内设的套件：
+- **`linear`** (默认): 极简一条龙。只有一个单线节点 `main`，适合一气呵成的小活。
+- **`develop`** (标准开发): `analyze`(普通) -> `plan_gate`(门控) -> `implement`(循环) -> `verify_gate`(门控) -> `finalize`(普通)
+- **`debug`** (排查修复): `reproduce`(普通) -> `locate`(普通) -> `fix`(循环) -> `verify_gate`(门控) -> `finalize`(普通)
+- **`refactor`** (代码重构): `baseline`(普通) -> `analyze`(普通) -> `refactor`(循环) -> `verify_gate`(门控) -> `finalize`(普通)
+
+---
+
+## 2. API 模式 (Modes) 及使用范式
+
+以最复杂的 `develop` 协议为例，演示一整套无缝连接的 API 调用顺序：
+
+### 步骤 1：初始化拉起流水线 (`init`)
+- **场景**：接到大的任务，最开始调用这个进行全链路大盘建档。
+- **指令格式**：`task_chain(mode="init", task_id="REQ_102", description="开发登录功能", protocol="develop")`
+- **系统反馈**：数据库中生成该任务的 5 个阶段。并且，**第一站阶段 `analyze` 的状态会自动被赋为 `active`（进行中）**。
+
+### 步骤 2：上交本阶段成果 (`complete`)
+- **场景**：你看一眼状态大盘，发现当前所处阶段已经是 `active` 了，并且你在本地文件或者系统代码里干完活了，你需要去销账。*(由于上面 init 默认把 analyze 活动化了，你此时直接 complete)*。
+- **指令格式**：`task_chain(mode="complete", task_id="REQ_102", phase_id="analyze", summary="我的本地工作做完了。")`
+- **系统反馈**：数据库中 `analyze` 节点状态由 `active` 变更为 `passed`。
+
+### 步骤 3：申请开启下个阶段 (`start`)
+- **场景**：上一站完成了，下一站 `plan_gate` 依然是灰色锁死的 `pending` 状态。你需要主动敲门去推开它。
+- **指令格式**：`task_chain(mode="start", task_id="REQ_102", phase_id="plan_gate")`
+- **系统反馈**：`plan_gate` 状态被翻转为 `active`。
+*(门打开了，你干活检查后，由于它是 gate 节点，你再次调用 complete 并带上 `result="pass"` 彻底通过它)*。
+
+### 步骤 4：循环节点派发子任务并入场 (`spawn`)
+- **场景**：当你经过层层打卡来到了 `loop` 节点（如 `implement`），且处于 `active`。此时无法直接 complete，必须把待办任务挂载上去。
+- **指令格式**：`task_chain(mode="spawn", task_id="REQ_102", phase_id="implement", sub_tasks=[{"id":"s1","name":"后端API"},{"id":"s2","name":"前端页面"}])`
+- **系统反馈**：`implement` 节点的肚子内生成了 2 个未处理的条目。其中第一条 `s1` 会自动进入并开始跑。
+
+### 步骤 5：击破子任务 (`complete_sub`)
+- **场景**：专门给 `loop` 阶段收尸销账使用。
+- **指令格式**：`task_chain(mode="complete_sub", task_id="REQ_102", phase_id="implement", sub_id="s1", summary="全部代码修改完毕测试通过。")`
+- **系统反馈**：自动标记 `s1` 销账完成，并顺接激活下一个目标 `s2`。一旦 `s2` 也被你 `complete_sub`，系统触发联锁反应：`implement` 大关卡自动判为 `passed` 过关。
+
+### 步骤 6：全链路清账结算 (`finish`)
+- **场景**：流水线上的每一个 phase 全部呈 `passed` 状态，走向结项大一统。
+- **指令格式**：`task_chain(mode="finish", task_id="REQ_102")`
+- **系统反馈**：这根记录链条被标记为 `finished` 深埋结项。
+
+---
+
+## 3. 辅助功能 API
+
+除了在轨道上推进，你随时可以使用下面两种 `mode` 观摩你的大盘状况：
+
+* **查看任务最新底牌 (`status` 或 `resume`)**:
+  * 传入：`task_chain(mode="status", task_id="REQ_102")`
+  * 返回：实时输出整个大盘目前的 JSON 数据全貌（当前所在的是第几关？是正在打卡，还是等你去主动 `start` 激活？）。你一旦对流程迷茫，甚至在恢复上下文记忆时，第一时间调用此功能。
+* **查看内置出厂协议说明 (`protocol`)**:
+  * 传入：`task_chain(mode="protocol")`
+  * 返回：打印所有的默认任务轨道流程。
+
+---
+
+## 4. 关键：关于 `summary` 填写的“自然收敛”法则
+
+在使用 `complete` 和 `complete_sub` 模式销账时，你会需要填写一个 `summary` 参数。
+很多时候系统设计者会陷入一种误区：要么想把所有的结果（如千字设计档、大量报错）硬塞进 `summary` 里当成接力棒传下去；要么走向另一个极端，要求强制使用物理文件指针来传递一切信息。
+
+**其实，请遵循大模型最“自然”的输出习惯：**
+
+1. **轻量信息直接写**
+   如果一个阶段（Phase）的结论本身就很简短，只是一两句决策（例如：“检查过了，没发现冲突” 或 “API 的 base_url 应该设为 /v2/api”），**请直接写在 `summary` 里。** 下一个阶段的模型能通过 Context 无缝读取，丝滑且高效，没必要脱裤子放屁去建个专门的文件。
+   
+2. **重型产物顺其自然**
+   如果阶段任务是“设计数据库结构”或者“拟定前后端接口”，大模型在执行过程中，**天然就会去创建并编写真实的源码或 Markdown 文件（如编写 `schema.sql` 或 `docs/api_spec.md`）**。这是项目的自然产物。
+   此时，`task_chain` 的 `summary` 只需要扮演一个**极其自然的进度汇报**：
+   > `summary="订单系统数据库设计已完成，建表语句已写入 docs/schema.sql。"`
+   
+   **绝对禁止**尝试把 `schema.sql` 里的几百行建表语句塞进 `summary`！因为未来的节点去调 `status` 时，会被这个包含了无数行生硬代码的巨型 JSON 彻底淹没，从而产生 Token 超限与死循环幻觉。
+
+简而言之：`task_chain` 就是一个打卡机。干轻活，直接说一两句结论；干重活，把产出物写进正常的工作代码/文档里，打卡时只汇报产出物的名字即可。

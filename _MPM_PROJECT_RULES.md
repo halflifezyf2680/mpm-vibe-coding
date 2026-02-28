@@ -15,7 +15,7 @@
 
 | 场景 | 必须使用的工具 |
 |------|---------------|
-| 刚接手陌生项目且无任何代码线索 / 上下文过多需收敛注意力 | `manager_analyze` |
+| 刚接手陌生项目且无任何代码线索 / 上下文过多需收敛注意力 | `manager_analyze` (可选) |
 | 任务涉及多模块/多阶段修改，预计需要多轮对话才能完成 | `task_chain` (协议状态机) |
 | 刚接手项目 / 宏观探索 | `project_map` |
 | 理解业务逻辑主链 | `flow_trace` |
@@ -39,11 +39,11 @@
 
 ## 检测结果
 
-| 项目类型 | 旧项目 (检测到 82 个源码文件，615 个符号) |
+| 项目类型 | 旧项目 (检测到 77 个源码文件，579 个符号) |
 |---------|------|
-| **函数/变量风格** | snake_case (43.6%) |
+| **函数/变量风格** | snake_case (46.3%) |
 | **类名风格** | PascalCase |
-| **常见前缀** | _, validate_ |
+| **常见前缀** | validate_, _ |
 
 ## 命名约定
 
@@ -53,7 +53,7 @@
 
 ## 代码示例 (从项目中提取)
 
-GetWikiStyleTemplate, MergeWikiStyleTemplate, URIToPath, init, main, DetectProjectRoot, ValidateProjectPath, main, RegisterMemoryTools, wrapMemo
+reproduce_issue, main, create_validation_image, init, main, convert, initializeSeed, setup, draw, hexToRgb
 
 ---
 
