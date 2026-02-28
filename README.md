@@ -1,4 +1,4 @@
-# <img src="docs/images/mpm_logo.png" height="56" style="vertical-align:middle;" /> MPM - Vibe Coding MCP
+# MPM - Vibe Coding MCP
 
 > **让 AI 从"猜代码"变成"懂代码"**
 
