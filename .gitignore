@@ -1,0 +1,45 @@
+# Build
+bin/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# MPM Data (本地数据库，不提交)
+.mcp-data/
+
+# Rust
+target/
+Cargo.lock
+
+# Go
+vendor/
+
+# Node
+node_modules/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp
+*.tmp
+*.log
+*.bak
+.tmp-tests/
+
+# Tool-generated temp dirs/files (do not commit)
+**/.tmp-tests/
+mcp-server-go/internal/tools/.tmp-tests/
+
+# Tool-generated stray files (do not commit)
+mcp-server-go/_MPM_PROJECT_RULES.md
+
+# Local-only docs (do not publish)
+docs/TASK_CHAIN_V3_FLOW.md

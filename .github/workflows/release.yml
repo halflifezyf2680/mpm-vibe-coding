@@ -1,0 +1,155 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g., v1.0.0)'
+        required: true
+        default: 'v1.0.0'
+
+env:
+  GO_VERSION: '1.21'
+
+jobs:
+  build:
+    name: Build ${{ matrix.os }}-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - os: windows
+            arch: amd64
+            runner: windows-latest
+            ext: .exe
+          - os: linux
+            arch: amd64
+            runner: ubuntu-latest
+            ext: ''
+          - os: darwin
+            arch: amd64
+            runner: macos-latest
+            ext: ''
+          - os: darwin
+            arch: arm64
+            runner: macos-latest
+            ext: ''
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: mcp-server-go/internal/services/ast_indexer_rust
+
+      - name: Build Go server
+        working-directory: mcp-server-go
+        run: |
+          go build -o bin/mpm-go${{ matrix.ext }} ./cmd/server
+
+      - name: Build Rust AST indexer
+        working-directory: mcp-server-go/internal/services/ast_indexer_rust
+        run: |
+          cargo build --release
+          cp target/release/ast_indexer_rust${{ matrix.ext }} ../../../bin/ast_indexer${{ matrix.ext }}
+
+      - name: Prepare release package
+        shell: bash
+        run: |
+          mkdir -p release/mpm-${{ matrix.os }}-${{ matrix.arch }}
+          cp mcp-server-go/bin/mpm-go${{ matrix.ext }} release/mpm-${{ matrix.os }}-${{ matrix.arch }}/
+          cp mcp-server-go/bin/ast_indexer${{ matrix.ext }} release/mpm-${{ matrix.os }}-${{ matrix.arch }}/
+          cp README.md release/mpm-${{ matrix.os }}-${{ matrix.arch }}/
+          cp README_EN.md release/mpm-${{ matrix.os }}-${{ matrix.arch }}/
+          cp QUICKSTART.md release/mpm-${{ matrix.os }}-${{ matrix.arch }}/
+          cp QUICKSTART_EN.md release/mpm-${{ matrix.os }}-${{ matrix.arch }}/
+          cp mcp-config-example.json release/mpm-${{ matrix.os }}-${{ matrix.arch }}/
+          cp -r docs release/mpm-${{ matrix.os }}-${{ matrix.arch }}/
+          rm -f release/mpm-${{ matrix.os }}-${{ matrix.arch }}/docs/DESIGN_task_chain_v3.md
+          rm -f release/mpm-${{ matrix.os }}-${{ matrix.arch }}/docs/TASK_CHAIN_V3_FLOW.md
+          cp -r opencode-agents release/mpm-${{ matrix.os }}-${{ matrix.arch }}/
+          cp -r mcp-server-go/configs release/mpm-${{ matrix.os }}-${{ matrix.arch }}/
+          
+          if [ "${{ matrix.os }}" = "windows" ]; then
+            cd release && 7z a mpm-${{ matrix.os }}-${{ matrix.arch }}.zip mpm-${{ matrix.os }}-${{ matrix.arch }}
+          else
+            cd release && tar -czvf mpm-${{ matrix.os }}-${{ matrix.arch }}.tar.gz mpm-${{ matrix.os }}-${{ matrix.arch }}
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mpm-${{ matrix.os }}-${{ matrix.arch }}
+          path: |
+            release/mpm-${{ matrix.os }}-${{ matrix.arch }}.zip
+            release/mpm-${{ matrix.os }}-${{ matrix.arch }}.tar.gz
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Get version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "VERSION=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.version.outputs.VERSION }}
+          name: MPM ${{ steps.version.outputs.VERSION }}
+          body: |
+            ## MPM - Vibe Coding MCP
+            
+            ### 下载说明
+            
+            | 平台 | 文件 |
+            |------|------|
+            | Windows x64 | `mpm-windows-amd64.zip` |
+            | Linux x64 | `mpm-linux-amd64.tar.gz` |
+            | macOS Intel | `mpm-darwin-amd64.tar.gz` |
+            | macOS Apple Silicon | `mpm-darwin-arm64.tar.gz` |
+            
+            ### 使用方法
+            
+            1. 下载对应平台的压缩包
+            2. 解压到任意目录
+            3. 在 MCP 客户端配置中指向 `mpm-go` 可执行文件
+            
+            ### 🐛 重要修复
+            
+            - 修复 task_chain 信息截断处理与渲染的一个小问题。
+          draft: false
+          prerelease: false
+          files: |
+            artifacts/**/*.zip
+            artifacts/**/*.tar.gz

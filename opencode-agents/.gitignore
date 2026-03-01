@@ -1,0 +1,7 @@
+.tmp/
+*.tmp
+
+# OpenCode runtime/session artifacts (keep agents committed)
+.opencode/sessions/
+.opencode/cache/
+.opencode/logs/
