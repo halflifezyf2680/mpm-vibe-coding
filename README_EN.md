@@ -8,23 +8,24 @@
 
 ---
 
-## The Industry Needs More Than Hype
+## Industry Status
 
-Many AI-era projects feel more like "stage performances" than "factories": polished, futuristic, grand narratives, yet completely avoiding the hard questions of production-grade delivery.
+The rise of AI coding tools has lowered the programming barrier, but also exposed some issues: many projects perform well in demos, yet lack systematic consideration for the following engineering concerns in production:
 
-Since LLMs started writing code, the "programming" barrier dropped. AI glue code flooded the ecosystem. Marketing to beginners became the default. Dressing up engineering emptiness with academic jargon turned into standard practice.
+- **Reproducibility**: Can execution results be reliably reproduced?
+- **Fault Recovery**: Can execution resume from checkpoints after failure?
+- **Permission Boundaries**: Are default permissions restrictive enough? Can privilege escalation be prevented?
+- **Acceptance & Audit**: Are there clear acceptance criteria? Are operations traceable?
+- **Self-Iteration**: How does state progress? What's the method?
 
-GitHub has become a playground for "product managers." Every week, another "industry-disrupting," "paradigm-shifting" project pops up. It's exhausting.
+Common patterns in current AI coding practice:
+- Relying on natural-language workflows and agent templates with insufficient enforcement
+- LLM-generated documentation that appears professional but fails to form a verifiable system
+- Users struggle to assess the reliability of LLM-generated content
 
-Real engineering asks real questions: Can it be reproduced? Can it resume from failure? Where are the permission boundaries, and are defaults restrictive enough? Can it block injection and privilege escalation against untrusted inputs and extensions? Are there clear acceptance criteria and audit trails? What's the self-iteration method? How does state progress?
+**Core Insight**: LLM engineering isn't about stacking prompts or multi-agent orchestration—it requires a **programmatic framework**: information cleaning, externalized state, workflow state machines, pre-verification, clear tool boundaries, and solidified + retrievable memory.
 
-But today's AI coding players don't care about these. They love grand document systems, text-described workflows, natural-language agent templates, and LLM-generated "skills"—all unreliable soft constraints.
-
-What's worse: LLM-generated docs often look professional, locally correct, but fail to form a rigorous system. This leaves people blindly confident after adopting LLMs, with no idea what they're actually generating or how they're being guided.
-
-LLM engineering isn't about stacking prompts or "permission-bloated" agent orchestration. The core is **programmatic frameworks**: clean information pipelines, converged LLM attention, externalized state, workflow-as-state-machine, verification-as-hard-gate, tool capability boundaries, and solidified + retrievable memory.
-
-Engineering hasn't changed. Only the driver changed—from algorithms and business processes to LLMs. Delivery capability still lives in the tooling framework, not the LLM.
+The tooling framework determines the upper bound of delivery capability. LLM is the driver.
 
 ---
 
@@ -32,8 +33,6 @@ Engineering hasn't changed. Only the driver changed—from algorithms and busine
 
 MPM is an **MCP engineering layer** that upgrades AI coding from "chatting" to "controlled delivery workflow".
 You can start with almost zero cognitive overhead: initialize first, then apply `_MPM_PROJECT_RULES.md` as your system rules.
-
-> **OpenCode Multi-Agent Mode**: MPM provides a 5-role Agent pack (PM / Architect / Coder / Expert / Spider) for direct use in OpenCode. See [opencode-agents/README.md](./opencode-agents/README.md).
 
 ### 🚀 30-Second Start (Do This First)
 
@@ -237,6 +236,12 @@ See [MANUAL_EN.md](./docs/MANUAL_EN.md#performance-comparison) for details.
 - `How to force full indexing?` -> `initialize_project(force_full_index=true)`
 
 See [MANUAL_EN.md](./docs/MANUAL_EN.md) for detailed examples.
+
+---
+
+## OpenCode Multi-Agent Mode
+
+MPM provides a 5-role Agent pack (PM / Architect / Coder / Expert / Spider) for direct use in OpenCode. See [opencode-agents/README.md](./opencode-agents/README.md).
 
 ---
 
